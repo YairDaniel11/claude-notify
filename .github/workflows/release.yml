@@ -1,0 +1,42 @@
+name: Build and Release
+
+# בכל שינוי בקוד (או בבנייה) ב-main נבנה ה-exe ונוצר Release חדש עם קבצים להורדה
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'build.cmd'
+      - '.github/workflows/release.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        shell: cmd
+        run: build.cmd
+
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory pkg | Out-Null
+          Copy-Item out/ClaudeNotify.exe, README.md pkg/
+          Compress-Archive -Path pkg/* -DestinationPath ClaudeNotify.zip
+
+      - name: Create release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $tag = "v1.0.${{ github.run_number }}"
+          $sha = "${{ github.sha }}".Substring(0, 7)
+          $msg = (git log -1 --pretty=%s).Trim()
+          $notes = "גרסה אוטומטית מהקומיט $sha`n`n$msg`n`nלהורדה: ClaudeNotify.exe (הרצה ישירה) או ClaudeNotify.zip (כולל README). הקובץ אינו חתום, ולכן SmartScreen עלול להזהיר בהרצה ראשונה."
+          gh release create $tag out/ClaudeNotify.exe ClaudeNotify.zip --title "Claude Notify $tag" --notes "$notes" --target ${{ github.sha }} --latest
