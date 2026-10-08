@@ -275,6 +275,41 @@ namespace ClaudeNotify
             if (IsIconic(h)) ShowWindow(h, 9);
             SetForegroundWindow(h);
         }
+
+        // מעלה את החלון ואז פותח בו את השיחה. ה-URI מגיע לחלון ה-VS שהיה אחרון בפוקוס, ולכן קודם מעלים את החלון
+        public static void FocusSession(long handle, string session)
+        {
+            if (handle == 0) return;
+            Focus(handle);
+            if (string.IsNullOrEmpty(session) || !Regex.IsMatch(session, "^[0-9a-fA-F-]{8,64}$")) return;
+            string scheme = SchemeFor(handle);
+            if (scheme == null) return;
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                try
+                {
+                    Thread.Sleep(300);
+                    var psi = new ProcessStartInfo(scheme + "://anthropic.claude-code/open?session=" + session);
+                    psi.UseShellExecute = true;
+                    Process.Start(psi);
+                }
+                catch (Exception ex) { Log.Write("open session error: " + ex.Message); }
+            });
+        }
+
+        static string SchemeFor(long handle)
+        {
+            try
+            {
+                uint pid; GetWindowThreadProcessId(new IntPtr(handle), out pid);
+                string n = Process.GetProcessById((int)pid).ProcessName;
+                if (n.Equals("Code", StringComparison.OrdinalIgnoreCase)) return "vscode";
+                if (n.Equals("Code - Insiders", StringComparison.OrdinalIgnoreCase)) return "vscode-insiders";
+                if (n.Equals("Cursor", StringComparison.OrdinalIgnoreCase)) return "cursor";
+            }
+            catch { }
+            return null;
+        }
     }
 
     // ---------------------------------------------------------------- Text helpers
@@ -567,6 +602,7 @@ namespace ClaudeNotify
         Config cfg;
         SettingsForm settings;
         long lastTarget;
+        string lastSession = "";
 
         public TrayContext(bool hidden)
         {
@@ -584,12 +620,12 @@ namespace ClaudeNotify
             enabledItem.Checked = cfg.Enabled;
             enabledItem.Click += delegate { cfg.Enabled = !cfg.Enabled; cfg.Save(); SyncEnabled(); };
             menu.Items.Add(enabledItem);
-            menu.Items.Add("התראת בדיקה", null, delegate { Show(0, "זו התראת בדיקה מ-Claude Notify. אם אתה רואה אותה, הכול עובד."); });
+            menu.Items.Add("התראת בדיקה", null, delegate { Show(0, "זו התראת בדיקה מ-Claude Notify. אם אתה רואה אותה, הכול עובד.", ""); });
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add("יציאה", null, delegate { tray.Visible = false; Application.Exit(); });
             tray.ContextMenuStrip = menu;
             tray.MouseDoubleClick += delegate(object s, MouseEventArgs e) { if (e.Button == MouseButtons.Left) ShowSettings(); };
-            tray.BalloonTipClicked += delegate { if (lastTarget != 0) WinApi.Focus(lastTarget); };
+            tray.BalloonTipClicked += delegate { if (lastTarget != 0) WinApi.FocusSession(lastTarget, lastSession); };
             tray.Visible = true;
             SyncEnabled();
 
@@ -620,7 +656,7 @@ namespace ClaudeNotify
 
         public void TestNotification()
         {
-            Show(0, "זו התראת בדיקה מ-Claude Notify. אם אתה רואה אותה, הכול עובד.");
+            Show(0, "זו התראת בדיקה מ-Claude Notify. אם אתה רואה אותה, הכול עובד.", "");
         }
 
         void PipeLoop()
@@ -657,6 +693,7 @@ namespace ClaudeNotify
             if (!cfg.Enabled) { Log.Write("skipped: disabled"); return; }
 
             string cwd = TextUtil.Str(j, "cwd");
+            string session = TextUtil.Str(j, "session_id");
             string text = TextUtil.Str(j, "last_assistant_message");
             if (text.Trim().Length == 0)
             {
@@ -685,11 +722,11 @@ namespace ClaudeNotify
                     {
                         // בזמן הסיכום ייתכן שהמשתמש כבר חזר לחלון
                         if (cfg.SkipWhenVisible && target != 0 && WinApi.IsShown(target)) return;
-                        Show(target, TextUtil.FirstWords(s ?? src, max));
+                        Show(target, TextUtil.FirstWords(s ?? src, max), session);
                     }));
                 });
             }
-            else Show(target, TextUtil.FirstWords(text, max));
+            else Show(target, TextUtil.FirstWords(text, max), session);
         }
 
         long FindTarget(string cwd)
@@ -710,14 +747,15 @@ namespace ClaudeNotify
 
         ToastForm toast;
 
-        void Show(long target, string body)
+        void Show(long target, string body, string session)
         {
             lastTarget = target;
+            lastSession = session;
             if (body.Length > 250) body = body.Substring(0, 247) + "...";
             if (cfg.UseCustomPopup)
             {
                 if (toast != null && !toast.IsDisposed) toast.Close();
-                toast = new ToastForm(body, target, cfg.DisplaySeconds, cfg.PopupLeft);
+                toast = new ToastForm(body, target, session, cfg.DisplaySeconds, cfg.PopupLeft);
                 toast.Show();
             }
             else tray.ShowBalloonTip(cfg.DisplaySeconds * 1000, "Claude Code", body, ToolTipIcon.None);
@@ -729,11 +767,13 @@ namespace ClaudeNotify
     {
         readonly System.Windows.Forms.Timer timer = new System.Windows.Forms.Timer();
         readonly long target;
+        readonly string session;
         int remainingMs;
 
-        public ToastForm(string body, long target, int seconds, bool left)
+        public ToastForm(string body, long target, string session, int seconds, bool left)
         {
             this.target = target;
+            this.session = session;
             remainingMs = seconds * 1000;
             FormBorderStyle = FormBorderStyle.None;
             ShowInTaskbar = false;
@@ -757,7 +797,7 @@ namespace ClaudeNotify
             Controls.Add(lbl);
             Size = new Size(width, 36 + textH + 14);
 
-            EventHandler click = delegate { if (this.target != 0) WinApi.Focus(this.target); Close(); };
+            EventHandler click = delegate { WinApi.FocusSession(this.target, this.session); Close(); };
             Click += click; title.Click += click; lbl.Click += click;
 
             var wa = Screen.PrimaryScreen.WorkingArea;
