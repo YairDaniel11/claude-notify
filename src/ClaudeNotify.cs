@@ -72,6 +72,25 @@ namespace ClaudeNotify
         }
     }
 
+    // ---------------------------------------------------------------- Theme
+    static class ThemeUtil
+    {
+        // קורא את ערכת הנושא (בהירה/כהה) שהמשתמש בחר באפליקציות Windows, כדי שההתראה תתאים לה
+        public static bool IsLightTheme()
+        {
+            try
+            {
+                using (var k = Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"))
+                {
+                    object v = k != null ? k.GetValue("AppsUseLightTheme") : null;
+                    if (v is int) return (int)v != 0;
+                }
+            }
+            catch { }
+            return true;
+        }
+    }
+
     // ---------------------------------------------------------------- Config
     class Config
     {
@@ -223,6 +242,9 @@ namespace ClaudeNotify
         [DllImport("user32.dll")] static extern bool SetForegroundWindow(IntPtr h);
         [DllImport("user32.dll")] static extern bool ShowWindow(IntPtr h, int c);
         [DllImport("dwmapi.dll")] static extern int DwmGetWindowAttribute(IntPtr h, int a, out int v, int s);
+        [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
+        [DllImport("user32.dll")] static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool fAttach);
+        [DllImport("kernel32.dll")] static extern uint GetCurrentThreadId();
 
         public static List<WinInfo> Find(string[] procNames)
         {
@@ -273,10 +295,30 @@ namespace ClaudeNotify
         {
             IntPtr h = new IntPtr(handle);
             if (IsIconic(h)) ShowWindow(h, 9);
-            SetForegroundWindow(h);
+            if (SetForegroundWindow(h)) return;
+
+            // Windows חוסם SetForegroundWindow לתהליכים שאינם בחזית - וזה כמעט תמיד המצב כאן,
+            // שכן האפליקציה רצה ברקע. העוקף המקובל: לחבר את תור הקלט שלנו לזה של התהליך שבחזית כרגע,
+            // מה שמעניק לנו זמנית את אותה הרשאה. בלי זה, עם כמה חלונות פתוחים, הקריאה נכשלת בשקט
+            // ו-VS Code ממשיך לחשוב שחלון אחר הוא זה שהיה אחרון בפוקוס.
+            uint curThread = GetCurrentThreadId();
+            IntPtr fg = GetForegroundWindow();
+            uint fgPid;
+            uint fgThread = fg != IntPtr.Zero ? GetWindowThreadProcessId(fg, out fgPid) : 0;
+            bool attached = fgThread != 0 && fgThread != curThread && AttachThreadInput(curThread, fgThread, true);
+            try
+            {
+                ShowWindow(h, 9);
+                SetForegroundWindow(h);
+            }
+            finally
+            {
+                if (attached) AttachThreadInput(curThread, fgThread, false);
+            }
         }
 
         // מעלה את החלון ואז פותח בו את השיחה. ה-URI מגיע לחלון ה-VS שהיה אחרון בפוקוס, ולכן קודם מעלים את החלון
+        // ומחכים שהוא אכן יהפוך לחלון הקדמי בפועל (ולא רק מניחים שעברו מספיק מילישניות)
         public static void FocusSession(long handle, string session)
         {
             if (handle == 0) return;
@@ -284,11 +326,14 @@ namespace ClaudeNotify
             if (string.IsNullOrEmpty(session) || !Regex.IsMatch(session, "^[0-9a-fA-F-]{8,64}$")) return;
             string scheme = SchemeFor(handle);
             if (scheme == null) return;
+            IntPtr h = new IntPtr(handle);
             ThreadPool.QueueUserWorkItem(delegate
             {
                 try
                 {
-                    Thread.Sleep(300);
+                    int waited = 0;
+                    while (GetForegroundWindow() != h && waited < 1500) { Thread.Sleep(25); waited += 25; }
+                    Thread.Sleep(150);
                     var psi = new ProcessStartInfo(scheme + "://anthropic.claude-code/open?session=" + session);
                     psi.UseShellExecute = true;
                     Process.Start(psi);
@@ -768,6 +813,7 @@ namespace ClaudeNotify
         readonly System.Windows.Forms.Timer timer = new System.Windows.Forms.Timer();
         readonly long target;
         readonly string session;
+        readonly Color borderColor = Color.FromArgb(217, 119, 87);
         int remainingMs;
 
         public ToastForm(string body, long target, string session, int seconds, bool left)
@@ -779,7 +825,11 @@ namespace ClaudeNotify
             ShowInTaskbar = false;
             TopMost = true;
             StartPosition = FormStartPosition.Manual;
-            BackColor = Color.FromArgb(40, 40, 44);
+            bool light = ThemeUtil.IsLightTheme();
+            Color bg = light ? Color.White : Color.FromArgb(40, 40, 44);
+            Color fg = light ? Color.FromArgb(30, 30, 30) : Color.White;
+            Color closeColor = light ? Color.Gray : Color.Silver;
+            BackColor = bg;
             Cursor = target != 0 ? Cursors.Hand : Cursors.Default;
 
             const int width = 380, inner = 340;
@@ -788,9 +838,9 @@ namespace ClaudeNotify
             int textH = TextRenderer.MeasureText(body, bodyFont, new Size(inner, 0),
                 TextFormatFlags.WordBreak | TextFormatFlags.RightToLeft | TextFormatFlags.TextBoxControl).Height + 4;
 
-            var title = new Label { Text = "Claude Code", Font = titleFont, ForeColor = Color.FromArgb(217, 119, 87), AutoSize = false, Size = new Size(inner, 22), Location = new Point(20, 10), TextAlign = ContentAlignment.TopRight, RightToLeft = RightToLeft.Yes };
-            var lbl = new Label { Text = body, Font = bodyFont, ForeColor = Color.White, AutoSize = false, Size = new Size(inner, textH), Location = new Point(20, 36), TextAlign = ContentAlignment.TopRight, RightToLeft = RightToLeft.Yes };
-            var close = new Label { Text = "✕", Font = new Font("Segoe UI", 9f), ForeColor = Color.Silver, AutoSize = true, Location = new Point(4, 4), Cursor = Cursors.Hand };
+            var title = new Label { Text = "Claude Code", Font = titleFont, ForeColor = borderColor, AutoSize = false, Size = new Size(inner, 22), Location = new Point(20, 10), TextAlign = ContentAlignment.TopRight, RightToLeft = RightToLeft.Yes };
+            var lbl = new Label { Text = body, Font = bodyFont, ForeColor = fg, AutoSize = false, Size = new Size(inner, textH), Location = new Point(20, 36), TextAlign = ContentAlignment.TopRight, RightToLeft = RightToLeft.Yes };
+            var close = new Label { Text = "✕", Font = new Font("Segoe UI", 9f), ForeColor = closeColor, AutoSize = true, Location = new Point(4, 4), Cursor = Cursors.Hand };
             close.Click += delegate { Close(); };
             Controls.Add(close);
             Controls.Add(title);
@@ -829,7 +879,7 @@ namespace ClaudeNotify
         protected override void OnPaint(PaintEventArgs e)
         {
             base.OnPaint(e);
-            using (var p = new Pen(Color.FromArgb(217, 119, 87)))
+            using (var p = new Pen(borderColor))
                 e.Graphics.DrawRectangle(p, 0, 0, Width - 1, Height - 1);
         }
 
