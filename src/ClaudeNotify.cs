@@ -75,7 +75,8 @@ namespace ClaudeNotify
     // ---------------------------------------------------------------- Theme
     static class ThemeUtil
     {
-        // קורא את ערכת הנושא (בהירה/כהה) שהמשתמש בחר באפליקציות Windows, כדי שההתראה תתאים לה
+        // קורא את ערכת הנושא (בהירה/כהה) שהמשתמש בחר באפליקציות Windows - משמש כגיבוי כשלא מצליחים
+        // לזהות את ערכת הנושא של VS Code/Cursor עצמם
         public static bool IsLightTheme()
         {
             try
@@ -88,6 +89,87 @@ namespace ClaudeNotify
             }
             catch { }
             return true;
+        }
+    }
+
+    // מזהה אם ערכת הנושא שנבחרה בפועל ב-VS Code/Cursor (ולא ב-Windows) היא בהירה או כהה, כדי
+    // שחלון ההתראה ייראה עקבי עם העורך. קורא קודם את settings.json של הסביבה (עם תמיכה ב-JSONC:
+    // הערות ופסיקים עודפים), ומנחש בהיר/כהה לפי שם ערכת הנושא. כשלא ניתן לקבוע - נופל חזרה לערכת
+    // הנושא של Windows.
+    static class VSCodeTheme
+    {
+        public static bool IsLightTheme(long handle, string cwd)
+        {
+            try
+            {
+                string procName = handle != 0 ? WinApi.ProcessNameOf(handle) : null;
+                if (procName == null) return ThemeUtil.IsLightTheme();
+
+                string label = null;
+                if (!string.IsNullOrEmpty(cwd))
+                    label = ReadColorThemeLabel(Path.Combine(cwd, ".vscode", "settings.json"));
+                if (label == null)
+                {
+                    string appData = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
+                    label = ReadColorThemeLabel(Path.Combine(appData, procName, "User", "settings.json"));
+                }
+                if (label == null) return ThemeUtil.IsLightTheme();
+
+                bool? byName = ClassifyByName(label);
+                return byName ?? ThemeUtil.IsLightTheme();
+            }
+            catch { return true; }
+        }
+
+        static string ReadColorThemeLabel(string settingsPath)
+        {
+            try
+            {
+                if (!File.Exists(settingsPath)) return null;
+                string json = StripJsonComments(File.ReadAllText(settingsPath, Encoding.UTF8));
+                var d = new JavaScriptSerializer().Deserialize<Dictionary<string, object>>(json);
+                object v;
+                if (d != null && d.TryGetValue("workbench.colorTheme", out v) && v != null) return v.ToString();
+            }
+            catch { }
+            return null;
+        }
+
+        static bool? ClassifyByName(string label)
+        {
+            string l = label.ToLowerInvariant();
+            if (l.Contains("high contrast light")) return true;
+            if (l.Contains("light")) return true;
+            if (l.Contains("dark")) return false;
+            if (l.Contains("high contrast") || l.Contains("contrast black")) return false;
+            return null;
+        }
+
+        // settings.json של VS Code הוא JSONC (תומך בהערות // ו-/* */ ובפסיק עודף לפני } או ]),
+        // מה שה-JSON הסטנדרטי לא יודע לפרש
+        static string StripJsonComments(string json)
+        {
+            var sb = new StringBuilder();
+            bool inStr = false, inLine = false, inBlock = false;
+            for (int i = 0; i < json.Length; i++)
+            {
+                char c = json[i];
+                char next = i + 1 < json.Length ? json[i + 1] : '\0';
+                if (inLine) { if (c == '\n') { inLine = false; sb.Append(c); } continue; }
+                if (inBlock) { if (c == '*' && next == '/') { inBlock = false; i++; } continue; }
+                if (inStr)
+                {
+                    sb.Append(c);
+                    if (c == '\\' && i + 1 < json.Length) sb.Append(json[++i]);
+                    else if (c == '"') inStr = false;
+                    continue;
+                }
+                if (c == '"') { inStr = true; sb.Append(c); continue; }
+                if (c == '/' && next == '/') { inLine = true; i++; continue; }
+                if (c == '/' && next == '*') { inBlock = true; i++; continue; }
+                sb.Append(c);
+            }
+            return Regex.Replace(sb.ToString(), @",(\s*[}\]])", "$1");
         }
     }
 
@@ -291,11 +373,11 @@ namespace ClaudeNotify
             return false;
         }
 
-        public static void Focus(long handle)
+        public static bool Focus(long handle)
         {
             IntPtr h = new IntPtr(handle);
             if (IsIconic(h)) ShowWindow(h, 9);
-            if (SetForegroundWindow(h)) return;
+            if (SetForegroundWindow(h)) { Log.Write("focus: direct SetForegroundWindow ok"); return true; }
 
             // Windows חוסם SetForegroundWindow לתהליכים שאינם בחזית - וזה כמעט תמיד המצב כאן,
             // שכן האפליקציה רצה ברקע. העוקף המקובל: לחבר את תור הקלט שלנו לזה של התהליך שבחזית כרגע,
@@ -306,15 +388,18 @@ namespace ClaudeNotify
             uint fgPid;
             uint fgThread = fg != IntPtr.Zero ? GetWindowThreadProcessId(fg, out fgPid) : 0;
             bool attached = fgThread != 0 && fgThread != curThread && AttachThreadInput(curThread, fgThread, true);
+            bool ok;
             try
             {
                 ShowWindow(h, 9);
-                SetForegroundWindow(h);
+                ok = SetForegroundWindow(h);
             }
             finally
             {
                 if (attached) AttachThreadInput(curThread, fgThread, false);
             }
+            Log.Write("focus: attach=" + attached + " SetForegroundWindow=" + ok);
+            return ok;
         }
 
         // מעלה את החלון ואז פותח בו את השיחה. ה-URI מגיע לחלון ה-VS שהיה אחרון בפוקוס, ולכן קודם מעלים את החלון
@@ -333,6 +418,8 @@ namespace ClaudeNotify
                 {
                     int waited = 0;
                     while (GetForegroundWindow() != h && waited < 1500) { Thread.Sleep(25); waited += 25; }
+                    bool reallyForeground = GetForegroundWindow() == h;
+                    Log.Write("focus session: waited=" + waited + "ms foreground=" + reallyForeground + " session=" + session);
                     Thread.Sleep(150);
                     var psi = new ProcessStartInfo(scheme + "://anthropic.claude-code/open?session=" + session);
                     psi.UseShellExecute = true;
@@ -354,6 +441,17 @@ namespace ClaudeNotify
             }
             catch { }
             return null;
+        }
+
+        // שם תהליך החלון - משמש גם לאיתור תיקיית הנתונים של VS Code/Cursor (זהה לשם התהליך)
+        public static string ProcessNameOf(long handle)
+        {
+            try
+            {
+                uint pid; GetWindowThreadProcessId(new IntPtr(handle), out pid);
+                return Process.GetProcessById((int)pid).ProcessName;
+            }
+            catch { return null; }
         }
     }
 
@@ -665,7 +763,7 @@ namespace ClaudeNotify
             enabledItem.Checked = cfg.Enabled;
             enabledItem.Click += delegate { cfg.Enabled = !cfg.Enabled; cfg.Save(); SyncEnabled(); };
             menu.Items.Add(enabledItem);
-            menu.Items.Add("התראת בדיקה", null, delegate { Show(0, "זו התראת בדיקה מ-Claude Notify. אם אתה רואה אותה, הכול עובד.", ""); });
+            menu.Items.Add("התראת בדיקה", null, delegate { Show(0, "זו התראת בדיקה מ-Claude Notify. אם אתה רואה אותה, הכול עובד.", "", ""); });
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add("יציאה", null, delegate { tray.Visible = false; Application.Exit(); });
             tray.ContextMenuStrip = menu;
@@ -701,7 +799,7 @@ namespace ClaudeNotify
 
         public void TestNotification()
         {
-            Show(0, "זו התראת בדיקה מ-Claude Notify. אם אתה רואה אותה, הכול עובד.", "");
+            Show(0, "זו התראת בדיקה מ-Claude Notify. אם אתה רואה אותה, הכול עובד.", "", "");
         }
 
         void PipeLoop()
@@ -767,11 +865,11 @@ namespace ClaudeNotify
                     {
                         // בזמן הסיכום ייתכן שהמשתמש כבר חזר לחלון
                         if (cfg.SkipWhenVisible && target != 0 && WinApi.IsShown(target)) return;
-                        Show(target, TextUtil.FirstWords(s ?? src, max), session);
+                        Show(target, TextUtil.FirstWords(s ?? src, max), session, cwd);
                     }));
                 });
             }
-            else Show(target, TextUtil.FirstWords(text, max), session);
+            else Show(target, TextUtil.FirstWords(text, max), session, cwd);
         }
 
         long FindTarget(string cwd)
@@ -792,7 +890,7 @@ namespace ClaudeNotify
 
         ToastForm toast;
 
-        void Show(long target, string body, string session)
+        void Show(long target, string body, string session, string cwd)
         {
             lastTarget = target;
             lastSession = session;
@@ -800,7 +898,7 @@ namespace ClaudeNotify
             if (cfg.UseCustomPopup)
             {
                 if (toast != null && !toast.IsDisposed) toast.Close();
-                toast = new ToastForm(body, target, session, cfg.DisplaySeconds, cfg.PopupLeft);
+                toast = new ToastForm(body, target, session, cwd, cfg.DisplaySeconds, cfg.PopupLeft);
                 toast.Show();
             }
             else tray.ShowBalloonTip(cfg.DisplaySeconds * 1000, "Claude Code", body, ToolTipIcon.None);
@@ -816,7 +914,7 @@ namespace ClaudeNotify
         readonly Color borderColor = Color.FromArgb(217, 119, 87);
         int remainingMs;
 
-        public ToastForm(string body, long target, string session, int seconds, bool left)
+        public ToastForm(string body, long target, string session, string cwd, int seconds, bool left)
         {
             this.target = target;
             this.session = session;
@@ -825,7 +923,7 @@ namespace ClaudeNotify
             ShowInTaskbar = false;
             TopMost = true;
             StartPosition = FormStartPosition.Manual;
-            bool light = ThemeUtil.IsLightTheme();
+            bool light = VSCodeTheme.IsLightTheme(target, cwd);
             Color bg = light ? Color.White : Color.FromArgb(40, 40, 44);
             Color fg = light ? Color.FromArgb(30, 30, 30) : Color.White;
             Color closeColor = light ? Color.Gray : Color.Silver;
