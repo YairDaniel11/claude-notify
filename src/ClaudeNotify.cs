@@ -890,14 +890,27 @@ namespace ClaudeNotify
                     string leaf = Path.GetFileName(dir);
                     if (leaf.Length == 0) break;
                     foreach (var w in wins)
-                        foreach (var seg in w.Title.Split(new[] { " - " }, StringSplitOptions.None))
+                    {
+                        // כותרות בעברית מגיעות עם תווי כיווניות בלתי נראים (RLM, LRE/RLE/PDF וכו') שמונעים השוואה
+                        string title = Regex.Replace(w.Title, "[‎‏‪-‮⁦-⁩]", "");
+                        foreach (var seg in title.Split(new[] { " - " }, StringSplitOptions.None))
                             if (seg.Trim().Equals(leaf, StringComparison.OrdinalIgnoreCase)) return w.Handle;
+                    }
                     dir = Path.GetDirectoryName(dir) ?? "";
                 }
                 // אין התאמה מדויקת: מנחשים רק כשיש חלון אחד. עם כמה חלונות עדיף לא לבחור חלון אקראי -
                 // אחרת הלחיצה מעלה את החלון הלא נכון ופותחת בו שיחה
                 if (wins.Count == 1) return wins[0].Handle;
+                // חלון בלי תיקייה פתוחה (הכותרת היא רק שם האפליקציה) מתאים ל-cwd שלא תואם אף תיקייה
+                WinInfo bare = null; int bareCount = 0;
+                foreach (var w in wins)
+                {
+                    string t = Regex.Replace(w.Title, "[‎‏‪-‮⁦-⁩]", "");
+                    if (t.IndexOf(" - ", StringComparison.Ordinal) < 0) { bare = w; bareCount++; }
+                }
+                if (bareCount == 1) return bare.Handle;
                 Log.Write("find: no unambiguous window for cwd=" + cwd + " among " + wins.Count);
+                foreach (var w in wins) Log.Write("find: window title=[" + w.Title + "]");
             }
             catch (Exception ex) { Log.Write("find error: " + ex.Message); }
             return 0;
