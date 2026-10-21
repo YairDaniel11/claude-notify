@@ -420,7 +420,11 @@ namespace ClaudeNotify
                     while (GetForegroundWindow() != h && waited < 1500) { Thread.Sleep(25); waited += 25; }
                     bool reallyForeground = GetForegroundWindow() == h;
                     Log.Write("focus session: waited=" + waited + "ms foreground=" + reallyForeground + " session=" + session);
-                    Thread.Sleep(150);
+                    // ה-URI מנותב לחלון שהיה אחרון בפוקוס. אם החלון שלנו לא הגיע לחזית, שליחת ה-URI
+                    // תפתח את השיחה בחלון אחר (או תיצור חלון חדש) - עדיף לא לשלוח כלל
+                    if (!reallyForeground) return;
+                    Thread.Sleep(300);
+                    if (GetForegroundWindow() != h) { Log.Write("focus session: lost foreground, not opening"); return; }
                     var psi = new ProcessStartInfo(scheme + "://anthropic.claude-code/open?session=" + session);
                     psi.UseShellExecute = true;
                     Process.Start(psi);
@@ -877,12 +881,23 @@ namespace ClaudeNotify
             try
             {
                 var wins = WinApi.Find(cfg.ProcessList());
-                string leaf = "";
-                if (cwd.Length > 0) leaf = Path.GetFileName(cwd.TrimEnd('\\', '/'));
-                if (leaf.Length > 0)
+                // כותרת חלון ב-VS Code: "קובץ - תיקיית-עבודה - Visual Studio Code". מתאימים לפי קטע שלם
+                // בכותרת (ולא תת-מחרוזת), קודם לתיקיית ה-cwd ואז לתיקיות האב שלה (ה-cwd יכול להיות
+                // תת-תיקייה של תיקיית העבודה שנפתחה בעורך)
+                string dir = cwd.Trim().TrimEnd('\\', '/');
+                for (int level = 0; level < 4 && dir.Length > 0; level++)
+                {
+                    string leaf = Path.GetFileName(dir);
+                    if (leaf.Length == 0) break;
                     foreach (var w in wins)
-                        if (w.Title.IndexOf(leaf, StringComparison.OrdinalIgnoreCase) >= 0) return w.Handle;
-                if (wins.Count > 0) return wins[0].Handle;
+                        foreach (var seg in w.Title.Split(new[] { " - " }, StringSplitOptions.None))
+                            if (seg.Trim().Equals(leaf, StringComparison.OrdinalIgnoreCase)) return w.Handle;
+                    dir = Path.GetDirectoryName(dir) ?? "";
+                }
+                // אין התאמה מדויקת: מנחשים רק כשיש חלון אחד. עם כמה חלונות עדיף לא לבחור חלון אקראי -
+                // אחרת הלחיצה מעלה את החלון הלא נכון ופותחת בו שיחה
+                if (wins.Count == 1) return wins[0].Handle;
+                Log.Write("find: no unambiguous window for cwd=" + cwd + " among " + wins.Count);
             }
             catch (Exception ex) { Log.Write("find error: " + ex.Message); }
             return 0;
