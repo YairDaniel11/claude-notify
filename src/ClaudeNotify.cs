@@ -563,11 +563,22 @@ namespace ClaudeNotify
         // מחזיר null בכל כשל
         public static string Run(string text, int maxWords)
         {
+            string input = text.Length > 6000 ? text.Substring(0, 6000) : text;
+            string prompt = "סכם את ההודעה הבאה בעברית בעד " + Math.Max(5, maxWords - 5) +
+                " מילים, בניסוח קצר וברור. החזר רק את הסיכום, בלי הקדמה ובלי סימוני עיצוב.\n\n--- ההודעה ---\n" + input;
+            string err;
+            string s = Ask(prompt, 40000, out err);
+            return string.IsNullOrEmpty(s) ? null : s;
+        }
+
+        // שולח prompt ל-claude -p ומחזיר את התשובה. בכל כשל מחזיר null, ובמשתנה error מופיע הסבר קצר
+        public static string Ask(string prompt, int timeoutMs, out string error)
+        {
+            error = null;
             try
             {
                 string exe = FindClaude();
-                if (exe == null) { Log.Write("summary: claude not found"); return null; }
-                string input = text.Length > 6000 ? text.Substring(0, 6000) : text;
+                if (exe == null) { Log.Write("summary: claude not found"); error = "Claude Code לא נמצא במחשב"; return null; }
                 string args = "-p --model haiku --no-session-persistence --strict-mcp-config --setting-sources local --disable-slash-commands --mcp-config \"{\\\"mcpServers\\\":{}}\"";
                 var psi = new ProcessStartInfo();
                 if (exe.EndsWith(".cmd", StringComparison.OrdinalIgnoreCase)) { psi.FileName = "cmd.exe"; psi.Arguments = "/c \"" + exe + "\" " + args; }
@@ -581,20 +592,17 @@ namespace ClaudeNotify
                 psi.EnvironmentVariables["CLAUDE_NOTIFY_CHILD"] = "1";
                 using (var p = Process.Start(psi))
                 {
-                    string prompt = "סכם את ההודעה הבאה בעברית בעד " + Math.Max(5, maxWords - 5) +
-                        " מילים, בניסוח קצר וברור. החזר רק את הסיכום, בלי הקדמה ובלי סימוני עיצוב.\n\n--- ההודעה ---\n" + input;
                     var bytes = new UTF8Encoding(false).GetBytes(prompt);
                     p.StandardInput.BaseStream.Write(bytes, 0, bytes.Length);
                     p.StandardInput.Close();
                     var outTask = p.StandardOutput.ReadToEndAsync();
                     p.StandardError.ReadToEndAsync();
-                    if (!p.WaitForExit(40000)) { try { p.Kill(); } catch { } Log.Write("summary: timeout"); return null; }
-                    if (p.ExitCode != 0) { Log.Write("summary: exit " + p.ExitCode); return null; }
-                    string s = outTask.Result.Trim();
-                    return s.Length > 0 ? s : null;
+                    if (!p.WaitForExit(timeoutMs)) { try { p.Kill(); } catch { } Log.Write("summary: timeout"); error = "הזמן הקצוב עבר"; return null; }
+                    if (p.ExitCode != 0) { Log.Write("summary: exit " + p.ExitCode); error = "claude החזיר שגיאה (קוד " + p.ExitCode + ")"; return null; }
+                    return outTask.Result.Trim();
                 }
             }
-            catch (Exception ex) { Log.Write("summary error: " + ex.Message); return null; }
+            catch (Exception ex) { Log.Write("summary error: " + ex.Message); error = ex.Message; return null; }
         }
     }
 
@@ -748,6 +756,8 @@ namespace ClaudeNotify
         readonly ToolStripMenuItem enabledItem;
         Config cfg;
         SettingsForm settings;
+        readonly ScheduleRunner sched;
+        ScheduleForm schedForm;
         long lastTarget;
         string lastSession = "";
 
@@ -756,6 +766,9 @@ namespace ClaudeNotify
             cfg = Config.Load();
             host = new Form();
             var handle = host.Handle; // יוצר handle כדי לאפשר BeginInvoke מ-threads אחרים
+            sched = new ScheduleRunner(host);
+            sched.Started += UpdateTrayText;
+            sched.Finished += OnSchedFinished;
 
             tray = new NotifyIcon();
             tray.Icon = Branding.MakeIcon(32);
@@ -768,8 +781,9 @@ namespace ClaudeNotify
             enabledItem.Click += delegate { cfg.Enabled = !cfg.Enabled; cfg.Save(); SyncEnabled(); };
             menu.Items.Add(enabledItem);
             menu.Items.Add("התראת בדיקה", null, delegate { Show(0, "זו התראת בדיקה מ-Claude Notify. אם אתה רואה אותה, הכול עובד.", "", ""); });
+            menu.Items.Add("הודעה מתוזמנת (פתיחת מכסה)...", null, delegate { ShowSchedule(); });
             menu.Items.Add(new ToolStripSeparator());
-            menu.Items.Add("יציאה", null, delegate { tray.Visible = false; Application.Exit(); });
+            menu.Items.Add("יציאה", null, delegate { sched.Cancel(); tray.Visible = false; Application.Exit(); });
             tray.ContextMenuStrip = menu;
             tray.MouseDoubleClick += delegate(object s, MouseEventArgs e) { if (e.Button == MouseButtons.Left) ShowSettings(); };
             tray.BalloonTipClicked += delegate { if (lastTarget != 0) WinApi.FocusSession(lastTarget, lastSession); };
@@ -786,8 +800,32 @@ namespace ClaudeNotify
         void SyncEnabled()
         {
             enabledItem.Checked = cfg.Enabled;
-            tray.Text = cfg.Enabled ? "Claude Notify - פעיל" : "Claude Notify - כבוי";
+            UpdateTrayText();
             if (settings != null) settings.Reload();
+        }
+
+        void UpdateTrayText()
+        {
+            string t = cfg.Enabled ? "Claude Notify - פעיל" : "Claude Notify - כבוי";
+            if (sched != null && sched.Running) t += " | מתוזמן " + sched.Target.ToString("HH:mm");
+            tray.Text = t;
+        }
+
+        void OnSchedFinished(string text, bool error)
+        {
+            UpdateTrayText();
+            if (sched.Cancelled) return;
+            tray.ShowBalloonTip(5000, "Claude Notify", text, error ? ToolTipIcon.Warning : ToolTipIcon.Info);
+            if (error) ShowSchedule();
+        }
+
+        public void ShowSchedule()
+        {
+            if (schedForm == null || schedForm.IsDisposed) schedForm = new ScheduleForm(sched);
+            schedForm.Reload();
+            schedForm.Show();
+            schedForm.WindowState = FormWindowState.Normal;
+            schedForm.Activate();
         }
 
         public void ConfigChanged(Config c) { cfg = c; SyncEnabled(); }
@@ -1040,7 +1078,7 @@ namespace ClaudeNotify
             FormBorderStyle = FormBorderStyle.FixedDialog;
             MaximizeBox = false;
             StartPosition = FormStartPosition.CenterScreen;
-            ClientSize = new Size(560, 600);
+            ClientSize = new Size(560, 660);
             Icon = Branding.MakeIcon(32);
 
             var panel = new FlowLayoutPanel();
@@ -1106,6 +1144,12 @@ namespace ClaudeNotify
             };
             hookRow.Controls.Add(btnInstall);
             hookRow.Controls.Add(btnRemove);
+
+            var schedRow = Row(panel);
+            schedRow.Margin = new Padding(3, 10, 3, 3);
+            var btnSched = new Button { Text = "הודעה מתוזמנת לפתיחת מכסה...", AutoSize = true, Padding = new Padding(6, 2, 6, 2) };
+            btnSched.Click += delegate { ctx.ShowSchedule(); };
+            schedRow.Controls.Add(btnSched);
 
             var btnRow = Row(panel);
             btnRow.Margin = new Padding(3, 18, 3, 3);
