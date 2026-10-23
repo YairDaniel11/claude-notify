@@ -25,7 +25,7 @@ namespace ClaudeNotify
             FormBorderStyle = FormBorderStyle.FixedDialog;
             MaximizeBox = false;
             StartPosition = FormStartPosition.CenterScreen;
-            Icon = Branding.MakeIcon(32);
+            Icon = Branding.AppIcon;
             ClientSize = new Size(Theme.S(540), Math.Min(Theme.S(620), Screen.PrimaryScreen.WorkingArea.Height - Theme.S(60)));
 
             bar.Dock = DockStyle.Bottom;
@@ -89,7 +89,7 @@ namespace ClaudeNotify
         {
             this.ctx = ctx; this.cfg = cfg;
 
-            header = new Header("Claude Notify", "", null);
+            header = new Header(L.T("הגדרות", "Settings"), "", null);
             content.Controls.Add(header);
 
             // ---- התראות
@@ -137,12 +137,22 @@ namespace ClaudeNotify
             hookRow = AddRow(ch, "", "", hookButtons, true, 0, L.T("הוספת הוק לקובץ ההגדרות של Claude Code, כדי שהתוכנה תקבל התראה בכל פעם שהוא מסיים להשיב.", "Adds a hook to the Claude Code settings so this app is notified whenever it finishes replying."));
             content.Controls.Add(ch);
 
+            // ---- כלים: שני החלונות הנוספים של התוכנה
+            var ct = new Card(L.T("כלים", "Tools"));
+            var btnSched = new PillButton(L.T("פתח", "Open"), false);
+            btnSched.Click += delegate { ctx.ShowSchedule(); };
+            AddRow(ct, L.T("הודעה מתוזמנת", "Scheduled message"), L.T("שליחת הודעה קצרה לקלוד בשעה שתבחר, כדי להתחיל את מכסת 5 השעות מראש.", "Sends Claude a short message at a time you choose, to start the 5-hour quota window early."), btnSched, false, 100, null);
+            var btnUsage = new PillButton(L.T("פתח", "Open"), false);
+            btnUsage.Click += delegate { ctx.ShowUsage(); };
+            AddRow(ct, L.T("מידע טכני", "Technical info"), L.T("טוקנים לפי שיחה, מכסת 5 השעות והמכסה השבועית, ובאיזה מודל Claude משתמש.", "Tokens per conversation, the 5-hour and weekly limits, and which model Claude uses."), btnUsage, false, 100, null);
+            content.Controls.Add(ct);
+
             btnInstall.Click += delegate
             {
                 try
                 {
                     HookInstaller.Install(); SaveStartup(tglStartup.Checked);
-                    MessageBox.Show(this, L.T("החיבור הותקן. אם ההתראות לא מופיעות, פתח /hooks ב-Claude Code או הפעל אותו מחדש.", "The connection was installed. If notifications do not appear, open /hooks in Claude Code or restart it."), "Claude Notify", MessageBoxButtons.OK, MessageBoxIcon.Information, MessageBoxDefaultButton.Button1, MsgOpts);
+                    Dialog.Show(this, "Claude Notify", L.T("החיבור הותקן. אם ההתראות לא מופיעות, פתח /hooks ב-Claude Code או הפעל אותו מחדש.", "The connection was installed. If notifications do not appear, open /hooks in Claude Code or restart it."));
                 }
                 catch (Exception ex) { Fail(ex); }
                 Reload();
@@ -157,21 +167,18 @@ namespace ClaudeNotify
             var flow = new FlowLayoutPanel { Dock = DockStyle.Fill, Padding = Theme.P(18, 10, 18, 0), WrapContents = false, BackColor = Color.White, FlowDirection = L.He ? FlowDirection.RightToLeft : FlowDirection.LeftToRight };
             var btnSave = new PillButton(L.T("שמור", "Save"), true);
             var btnTest = new PillButton(L.T("התראת בדיקה", "Test notification"), false);
-            var btnSched = new PillButton(L.T("הודעה מתוזמנת...", "Scheduled message..."), false);
             btnSave.Margin = btnTest.Margin = Theme.P(0, 0, 10, 0);
             btnSave.Click += delegate { Save(); Hide(); };
             btnTest.Click += delegate { Save(); ctx.TestNotification(); };
-            btnSched.Click += delegate { ctx.ShowSchedule(); };
-            flow.Controls.Add(btnSave); flow.Controls.Add(btnTest); flow.Controls.Add(btnSched);
+            flow.Controls.Add(btnSave); flow.Controls.Add(btnTest);
             bar.Controls.Add(flow);
             AcceptButton = btnSave;
-            tip.SetToolTip(btnSched, L.T("שליחת הודעה קצרה לקלוד בשעה שתבחר, כדי להתחיל את מכסת 5 השעות מראש.", "Sends a short message to Claude at a time you choose, to start the 5-hour quota window early."));
             Reload();
         }
 
         void Fail(Exception ex)
         {
-            MessageBox.Show(this, L.T("הפעולה נכשלה: ", "The action failed: ") + ex.Message, "Claude Notify", MessageBoxButtons.OK, MessageBoxIcon.Error, MessageBoxDefaultButton.Button1, MsgOpts);
+            Dialog.Show(this, "Claude Notify", L.T("הפעולה נכשלה: ", "The action failed: ") + ex.Message);
         }
 
         static bool StartupEnabled()
@@ -244,32 +251,187 @@ namespace ClaudeNotify
         }
     }
 
-    // בורר חלון VS Code: תיבה נפתחת + כפתור רענון
+    // בורר חלונות VS Code: שורה לכל חלון עם מתג, מתג "בחר הכל", וכפתור רענון
+    class WinEntry { public VsWin Win; public Label Lbl; public ToggleSwitch Tgl; }
+
     class WindowPicker : Panel
     {
-        public readonly Dropdown Combo;
         public readonly PillButton RefreshBtn;
+        readonly ToggleSwitch allToggle = new ToggleSwitch();
+        readonly Label lblAll = new Label(), lblEmpty = new Label(), lblNote = new Label();
+        readonly List<WinEntry> items = new List<WinEntry>();
+        readonly ToolTip tip = new ToolTip { AutoPopDelay = 30000, InitialDelay = 350, ShowAlways = true };
+        bool busy;
+        int RowH { get { return Theme.S(34); } }
 
         public WindowPicker()
         {
             BackColor = Theme.Card;
-            Height = Theme.S(40);
-            Combo = Ctl.Combo(300, L.He);
+            DoubleBuffered = true;
+            SetStyle(ControlStyles.ResizeRedraw, true);
             RefreshBtn = new PillButton(L.T("רענן", "Refresh"), false);
             RefreshBtn.Height = Theme.S(30);
-            Controls.Add(Combo); Controls.Add(RefreshBtn);
+            StyleLabel(lblAll, true); lblAll.Text = L.T("בחר הכל", "Select all");
+            StyleLabel(lblEmpty, false); lblEmpty.Text = L.T("לא נמצאו חלונות VS Code פתוחים", "No open VS Code windows found");
+            StyleLabel(lblNote, false); lblNote.Font = Theme.F(8.5f);
+            allToggle.CheckedChanged += delegate
+            {
+                if (busy) return;
+                busy = true;
+                foreach (var it in items) it.Tgl.Checked = allToggle.Checked;
+                busy = false;
+            };
+            Controls.Add(lblAll); Controls.Add(allToggle); Controls.Add(lblEmpty); Controls.Add(lblNote); Controls.Add(RefreshBtn);
+            SetWindows(new List<VsWin>(), null);
         }
 
-        protected override void OnLayout(LayoutEventArgs e)
+        static void StyleLabel(Label l, bool semi)
         {
-            base.OnLayout(e);
-            if (Combo == null || RefreshBtn == null) return;
+            l.AutoSize = false;
+            l.AutoEllipsis = true;
+            l.BackColor = Theme.Card;
+            l.ForeColor = semi ? Theme.Text : Theme.Muted;
+            l.Font = semi ? Theme.Semi(10f) : Theme.F(9f);
+            l.RightToLeft = L.He ? RightToLeft.Yes : RightToLeft.No;
+            l.TextAlign = ContentAlignment.MiddleLeft;   // WinForms הופך יישור תחת RTL, ולכן MiddleLeft = ההתחלה בשני הכיוונים
+        }
+
+        static string Display(VsWin w)
+        {
+            string t = w.Title;
+            const string suffix = " - Visual Studio Code";
+            bool bare = t == "Visual Studio Code";
+            if (t.EndsWith(suffix, StringComparison.Ordinal)) t = t.Substring(0, t.Length - suffix.Length);
+            if (w.Count > 1) t += " (" + (w.Index + 1) + ")";
+            if (w.Conv.Length > 0) return t + " - " + w.Conv;
+            return bare ? t + " " + L.T("(חלון בלי תיקייה)", "(window with no folder)") : t;
+        }
+
+        public void SetWindows(List<VsWin> wins, ICollection<string> selectedKeys)
+        {
+            foreach (var it in items) { Controls.Remove(it.Lbl); Controls.Remove(it.Tgl); it.Lbl.Dispose(); it.Tgl.Dispose(); }
+            items.Clear();
+            busy = true;
+            foreach (var w in wins)
+            {
+                var e = new WinEntry { Win = w, Lbl = new Label(), Tgl = new ToggleSwitch() };
+                StyleLabel(e.Lbl, false);
+                e.Lbl.ForeColor = Theme.Text;
+                e.Lbl.Text = Display(w);
+                tip.SetToolTip(e.Lbl, e.Lbl.Text);
+                e.Tgl.Checked = selectedKeys != null && selectedKeys.Contains(w.Key);
+                e.Tgl.CheckedChanged += delegate { if (!busy) SyncAll(); };
+                items.Add(e);
+                Controls.Add(e.Lbl); Controls.Add(e.Tgl);
+            }
+            busy = false;
+            SyncAll();
+            lblEmpty.Visible = items.Count == 0;
+            lblAll.Visible = allToggle.Visible = items.Count > 0;
+            DoLayout();
+        }
+
+        void SyncAll()
+        {
+            bool prev = busy;
+            busy = true;
+            bool all = items.Count > 0;
+            foreach (var it in items) if (!it.Tgl.Checked) all = false;
+            allToggle.Checked = all;
+            allToggle.Enabled = items.Count > 0;
+            busy = prev;
+        }
+
+        // מעדכן כותרות שיחה שזוהו ברקע (מפתח חלון -> כותרת)
+        public void SetConvs(Dictionary<string, string> convs)
+        {
+            foreach (var it in items)
+            {
+                string c;
+                if (convs.TryGetValue(it.Win.Key, out c) && c.Length > 0) it.Win.Conv = c;
+                it.Lbl.Text = Display(it.Win);
+                tip.SetToolTip(it.Lbl, it.Lbl.Text);
+            }
+        }
+
+        public void SetNote(string text) { lblNote.Text = text; }
+
+        public List<string> SelectedKeys()
+        {
+            var res = new List<string>();
+            foreach (var it in items) if (it.Tgl.Checked) res.Add(it.Win.Key);
+            return res;
+        }
+
+        public Dictionary<string, string> SelectedConvs()
+        {
+            var res = new Dictionary<string, string>();
+            foreach (var it in items) if (it.Tgl.Checked && it.Win.Conv.Length > 0) res[it.Win.Key] = it.Win.Conv;
+            return res;
+        }
+
+        protected override void OnLayout(LayoutEventArgs e) { base.OnLayout(e); DoLayout(); }
+
+        void DoLayout()
+        {
+            if (RefreshBtn == null) return;
+            bool he = L.He;
+            int tw = Theme.S(46), gap = Theme.S(12), rowH = RowH;
+            int n = items.Count;
+            int y = 0;
+            int lw = Math.Max(50, Width - tw - gap);
+            if (n > 0)
+            {
+                PlaceRow(lblAll, allToggle, y, lw, tw, rowH, he);
+                y += rowH;
+                for (int i = 0; i < n; i++, y += rowH) PlaceRow(items[i].Lbl, items[i].Tgl, y, lw, tw, rowH, he);
+            }
+            else
+            {
+                lblEmpty.SetBounds(0, y, Width, rowH);
+                y += rowH;
+            }
             int bw = RefreshBtn.Width;
-            RefreshBtn.Top = (Height - RefreshBtn.Height) / 2;
-            Combo.Top = (Height - Combo.Height) / 2;
-            Combo.Width = Math.Max(100, Width - bw - Theme.S(10));
-            if (L.He) { Combo.Left = Width - Combo.Width; RefreshBtn.Left = 0; }
-            else { Combo.Left = 0; RefreshBtn.Left = Width - bw; }
+            int by = y + Theme.S(4);
+            RefreshBtn.Top = by + (rowH - RefreshBtn.Height) / 2;
+            int nw = Math.Max(20, Width - bw - gap);
+            if (he) { RefreshBtn.Left = Width - bw; lblNote.SetBounds(0, by, nw, rowH); }
+            else { RefreshBtn.Left = 0; lblNote.SetBounds(bw + gap, by, nw, rowH); }
+            int h = by + rowH + Theme.S(2);
+            if (Height != h) { Height = h; RelayoutUp(); }
+        }
+
+        void PlaceRow(Label l, ToggleSwitch t, int y, int lw, int tw, int rowH, bool he)
+        {
+            t.Top = y + (rowH - t.Height) / 2;
+            l.SetBounds(he ? Width - lw : 0, y, lw, rowH - 2);
+            t.Left = he ? 0 : Width - tw;
+        }
+
+        // גובה הבורר השתנה: מסדרים מחדש את הכרטיס שמכיל אותו
+        void RelayoutUp()
+        {
+            Control p = Parent;
+            while (p != null)
+            {
+                var st = p as Stack;
+                if (st != null) { st.Relayout(); return; }
+                p = p.Parent;
+            }
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing) tip.Dispose();
+            base.Dispose(disposing);
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            base.OnPaint(e);
+            if (items.Count > 0)
+                using (var p = new Pen(Theme.Border))
+                    e.Graphics.DrawLine(p, 0, RowH - 1, Width, RowH - 1);
         }
     }
 
@@ -278,14 +440,15 @@ namespace ClaudeNotify
     {
         readonly ScheduleRunner runner;
         List<BrowserProfile> profiles = new List<BrowserProfile>();
-        List<string> windowTitles = new List<string>();
+        Dictionary<string, string> savedConvs = new Dictionary<string, string>();
+        int loadGen;
         Dropdown cmbMethod, cmbProfile, cmbWhen;
         WindowPicker picker;
         Field fldUrl, fldText;
         Stepper numDelay, numMinWait, numMaxWait, numTabs, numBattery;
         TimeBox dtpTime;
-        ToggleSwitch tglSend, tglWake, tglAwake, tglScreenOff, tglAdv;
-        Row rowMethod, rowProfile, rowUrl, rowWindow, rowDelay, rowTime, rowSend, rowAdv, rowMin, rowMax, rowTabs;
+        ToggleSwitch tglSend, tglWake, tglAwake, tglScreenOff, tglAdv, tglNewChat;
+        Row rowMethod, rowProfile, rowUrl, rowWindow, rowDelay, rowTime, rowSend, rowAdv, rowMin, rowMax, rowTabs, rowNewChat;
         Card cardAdv;
         PillButton btnStart, btnCancel;
         Label lblStatus, lblPower;
@@ -308,14 +471,17 @@ namespace ClaudeNotify
             cmbMethod = Ctl.Combo(300, L.He);
             cmbMethod.Items.Add(L.T("דרך הדפדפן (פרופיל מחובר ל-claude.ai)", "Through the browser (profile signed in to claude.ai)"));
             cmbMethod.Items.Add(L.T("דרך Claude Code, בלי דפדפן", "Through Claude Code, no browser"));
-            cmbMethod.Items.Add(L.T("לחלון VS Code שנבחר (רואים את ההודעה)", "To a chosen VS Code window (you can see the message)"));
+            cmbMethod.Items.Add(L.T("לחלונות VS Code שנבחרו (רואים את ההודעה)", "To chosen VS Code windows (you can see the message)"));
             rowMethod = AddRow(c1, L.T("שיטת שליחה", "Send method"), "", cmbMethod, true, 0,
-                L.T("דרך הדפדפן: פותח Chrome/Edge/Brave ומקליד ב-claude.ai (דורש פרופיל מחובר ומחשב לא נעול).\nדרך Claude Code: שליחה שקטה ברקע, בלי חלון - הכי אמין, אבל לא רואים את ההודעה באף חלון.\nלחלון VS Code: פותח שיחה חדשה עם ההודעה בחלון שתבחר, ושולח.",
-                    "Browser: opens Chrome/Edge/Brave and types into claude.ai (needs a signed-in profile and an unlocked computer).\nClaude Code: silent background send, no window - most reliable, but you will not see the message in any window.\nVS Code window: opens a new conversation with the message in the window you choose, and sends it."));
+                L.T("דרך הדפדפן: פותח Chrome/Edge/Brave ומקליד ב-claude.ai (דורש פרופיל מחובר ומחשב לא נעול).\nדרך Claude Code: שליחה שקטה ברקע, בלי חלון - הכי אמין, אבל לא רואים את ההודעה באף חלון.\nלחלונות VS Code: שולח הודעה נפרדת לכל חלון שתסמן (אחד אחרי השני), בשיחה חדשה או בשיחה הפעילה.",
+                    "Browser: opens Chrome/Edge/Brave and types into claude.ai (needs a signed-in profile and an unlocked computer).\nClaude Code: silent background send, no window - most reliable, but you will not see the message in any window.\nVS Code windows: sends a separate message to each window you tick (one after another), in a new or the active conversation."));
 
             picker = new WindowPicker();
-            picker.RefreshBtn.Click += delegate { LoadWindows(SelectedWindowTitle()); };
-            rowWindow = AddRow(c1, L.T("חלון VS Code", "VS Code window"), L.T("לאיזה חלון עורך לשלוח. חלון בלי תיקייה מופיע כ-\"Visual Studio Code\". אם פתחת או סגרת חלונות - לחץ \"רענן\".", "Which editor window to send to. A window with no folder appears as \"Visual Studio Code\". If you opened or closed windows, press \"Refresh\"."), picker, true, 0, null);
+            picker.RefreshBtn.Click += delegate { LoadWindows(picker.SelectedKeys(), picker.SelectedConvs()); };
+            rowWindow = AddRow(c1, L.T("חלונות VS Code", "VS Code windows"), L.T("סמן לאילו חלונות לשלוח. לכל חלון נשלחת הודעה נפרדת, בזה אחר זה. לצד שם החלון מופיעה כותרת השיחה שבו. אם פתחת או סגרת חלונות - לחץ \"רענן\".", "Tick the windows to send to. Each window gets its own message, one after another. Each window shows its conversation title. If you opened or closed windows, press \"Refresh\"."), picker, true, 0, null);
+            tglNewChat = new ToggleSwitch();
+            rowNewChat = AddRow(c1, L.T("שיחה חדשה בכל חלון", "New chat in each window"), L.T("דלוק = נפתחת שיחה חדשה. כבוי = ממשיכים בשיחה הפעילה של החלון (מתאים להמשך עבודה אחרי איפוס המכסה).", "On = a new conversation is opened. Off = continue in the window's active conversation (good for resuming work after the quota resets)."), tglNewChat, false, 54,
+                L.T("כבוי: ההודעה נכתבת בתיבת ההקלדה הגלויה של Claude בחלון, ללא פתיחת שיחה חדשה. טיוטה שכבר כתובה בתיבה תוחלף.", "Off: the message is typed into the visible Claude input box of the window, without opening a new conversation. A draft already in the box is replaced."));
 
             cmbProfile = Ctl.Combo(300, false);
             rowProfile = AddRow(c1, L.T("פרופיל דפדפן", "Browser profile"), L.T("הפרופיל שמחובר לחשבון Claude שלך. הדפדפן ייפתח איתו.", "The profile signed in to your Claude account. The browser opens with it."), cmbProfile, true, 0, null);
@@ -415,37 +581,51 @@ namespace ClaudeNotify
 
         void ShowHelp()
         {
-            MessageBox.Show(this,
-                L.T("למה צריך את זה?\nמכסת השימוש של Claude מתאפסת בחלונות של 5 שעות, שמתחילים מההודעה הראשונה. אם ההודעה הראשונה נשלחת מוקדם (למשל ב-6:00 בבוקר), המכסה מתחדשת ב-11:00, באמצע יום העבודה.\n\n" +
-                    "איך משתמשים?\n1. בחר שיטת שליחה (מומלץ: \"דרך Claude Code\", או \"לחלון VS Code\" אם רוצים לראות את ההודעה).\n2. אם בחרת חלון VS Code - בחר איזה מהחלונות הפתוחים.\n3. כתוב הודעה קצרה, למשל \"היי\".\n4. בחר מתי: אחרי כמה שניות (לבדיקה) או בשעה קבועה.\n5. לחץ \"התחל\".\n\n" +
+            Dialog.Show(this, L.T("Claude Notify - עזרה", "Claude Notify - Help"), L.T("למה צריך את זה?\nמכסת השימוש של Claude מתאפסת בחלונות של 5 שעות, שמתחילים מההודעה הראשונה. אם ההודעה הראשונה נשלחת מוקדם (למשל ב-6:00 בבוקר), המכסה מתחדשת ב-11:00, באמצע יום העבודה.\n\n" +
+                    "איך משתמשים?\n1. בחר שיטת שליחה (מומלץ: \"דרך Claude Code\", או \"לחלון VS Code\" אם רוצים לראות את ההודעה).\n2. אם בחרת חלונות VS Code - סמן לאילו חלונות לשלוח (לכל אחד נשלחת הודעה נפרדת), ובחר אם לפתוח שיחה חדשה או להמשיך בפעילה.\n3. כתוב הודעה קצרה, למשל \"היי\".\n4. בחר מתי: אחרי כמה שניות (לבדיקה) או בשעה קבועה.\n5. לחץ \"התחל\".\n\n" +
                     "חשוב לדעת:\n• המחשב צריך להישאר דלוק (בשיטות עם חלון - גם לא נעול).\n• אפשר לסגור את החלון - התזמון רץ ברקע מהאייקון ליד השעון.\n• יציאה מהתוכנה מבטלת את התזמון.\n• בשעת השליחה בשיטות עם חלון - לא לגעת במקלדת ובעכבר.",
                     "Why do you need this?\nClaude's usage quota resets in 5-hour windows that start from the first message. If the first message is sent early (for example at 6:00 AM), the quota renews at 11:00, in the middle of your workday.\n\n" +
-                    "How to use it?\n1. Choose a send method (recommended: \"Through Claude Code\", or \"To a VS Code window\" if you want to see the message).\n2. If you chose a VS Code window - pick which of the open windows.\n3. Write a short message, for example \"hi\".\n4. Choose when: after a few seconds (to test) or at a fixed time.\n5. Press \"Start\".\n\n" +
-                    "Good to know:\n• The computer must stay on (for window-based methods - also unlocked).\n• You can close this window - the schedule keeps running in the background from the tray icon.\n• Exiting the app cancels the schedule.\n• While window-based methods run, do not touch the keyboard or mouse."),
-                L.T("Claude Notify - עזרה", "Claude Notify - Help"), MessageBoxButtons.OK, MessageBoxIcon.Information, MessageBoxDefaultButton.Button1, MsgOpts);
+                    "How to use it?\n1. Choose a send method (recommended: \"Through Claude Code\", or \"To a VS Code window\" if you want to see the message).\n2. If you chose VS Code windows - tick which windows to send to (each gets its own message), and choose a new chat or continuing the active one.\n3. Write a short message, for example \"hi\".\n4. Choose when: after a few seconds (to test) or at a fixed time.\n5. Press \"Start\".\n\n" +
+                    "Good to know:\n• The computer must stay on (for window-based methods - also unlocked).\n• You can close this window - the schedule keeps running in the background from the tray icon.\n• Exiting the app cancels the schedule.\n• While window-based methods run, do not touch the keyboard or mouse."));
         }
 
-        string SelectedWindowTitle()
+        // מציג מיד את רשימת החלונות, ואז מזהה ברקע את כותרת השיחה של כל חלון (UI Automation) ומעדכן
+        void LoadWindows(ICollection<string> selected, Dictionary<string, string> convs)
         {
-            int i = picker.Combo.SelectedIndex;
-            return i >= 0 && i < windowTitles.Count ? windowTitles[i] : "";
-        }
-
-        void LoadWindows(string selected)
-        {
-            windowTitles = new List<string>();
-            picker.Combo.Items.Clear();
-            int sel = -1;
-            foreach (var w in WinApi.Find(Config.Load().ProcessList()))
+            int gen = ++loadGen;
+            var wins = VsWindows.List();
+            var sel = new List<string>();
+            foreach (var k in selected ?? new List<string>())
+                foreach (var w in wins) if (w.Key == k || w.Key == k + "#0") { sel.Add(w.Key); break; }
+            if (sel.Count == 0 && wins.Count > 0 && (selected == null || selected.Count == 0)) sel.Add(wins[0].Key);
+            if (convs != null)
+                foreach (var w in wins) { string c; if (convs.TryGetValue(w.Key, out c)) w.Conv = c; }
+            picker.SetWindows(wins, sel);
+            if (wins.Count == 0) { picker.SetNote(""); FitContent(); return; }
+            picker.SetNote(L.T("מזהה כותרות שיחה...", "Reading conversation titles..."));
+            FitContent();
+            var sync = System.Threading.SynchronizationContext.Current;
+            System.Threading.ThreadPool.QueueUserWorkItem(delegate
             {
-                string t = WinApi.CleanTitle(w.Title);
-                if (windowTitles.Contains(t)) continue;   // כותרות זהות: הרשימה מציגה אחת, והשליחה תלך לעליונה
-                if (t == selected) sel = windowTitles.Count;
-                windowTitles.Add(t);
-                picker.Combo.Items.Add(t == "Visual Studio Code" ? "Visual Studio Code " + L.T("(חלון בלי תיקייה)", "(window with no folder)") : t);
-            }
-            if (sel < 0 && windowTitles.Count > 0) sel = 0;
-            if (sel >= 0) picker.Combo.SelectedIndex = sel;
+                var res = new Dictionary<string, string>();
+                try
+                {
+                    var known = ConvTitles.Known();
+                    foreach (var w in wins)
+                    {
+                        string t = ConvTitles.ForWindow(w.Handle, known);
+                        if (t.Length > 0) res[w.Key] = t;
+                    }
+                }
+                catch (Exception ex) { Log.Write("conv titles: " + ex.Message); }
+                System.Threading.SendOrPostCallback done = delegate
+                {
+                    if (IsDisposed || gen != loadGen) return;
+                    picker.SetConvs(res);
+                    picker.SetNote("");
+                };
+                if (sync != null) sync.Post(done, null);
+            });
         }
 
         void ApplyVisibility()
@@ -457,11 +637,12 @@ namespace ClaudeNotify
             rowSend.Shown = browser;
             rowAdv.Shown = browser;
             rowWindow.Shown = vs;
+            rowNewChat.Shown = vs;
             cardAdv.Shown = browser && tglAdv.Checked;
             rowDelay.Shown = cmbWhen.SelectedIndex != 1;
             rowTime.Shown = cmbWhen.SelectedIndex == 1;
             string hint = vs
-                ? L.T("מעלה את החלון שבחרת לחזית, פותח בו שיחה חדשה עם ההודעה ושולח. בשעת ההפעלה לא לגעת במקלדת ובעכבר.", "Brings the chosen window to the front, opens a new conversation with the message and sends it. Do not touch the keyboard or mouse while it runs.")
+                ? L.T("מעלה כל חלון שבחרת לחזית (בזה אחר זה), פותח בו שיחה חדשה או ממשיך בפעילה, ושולח הודעה נפרדת. בשעת ההפעלה לא לגעת במקלדת ובעכבר.", "Brings each chosen window to the front (one after another), opens a new conversation or continues the active one, and sends a separate message. Do not touch the keyboard or mouse while it runs.")
                 : browser
                 ? L.T("פותח את הדפדפן עם הפרופיל שבחרת (חייב להיות מחובר ל-claude.ai), ומקליד שם. בשעת ההפעלה לא לגעת במקלדת ובעכבר.", "Opens the browser with the chosen profile (must be signed in to claude.ai) and types there. Do not touch the keyboard or mouse while it runs.")
                 : L.T("שליחה שקטה דרך Claude Code (מודל Haiku), בלי חלון ובלי הקלדה - לכן גם לא תלויה במסך נעול. נספרת על אותה מכסה.", "A silent send through Claude Code (Haiku model), with no window and no typing - so it does not depend on the screen being locked. Counts against the same quota.");
@@ -486,7 +667,9 @@ namespace ClaudeNotify
         {
             cmbMethod.SelectedIndex = s.Method == "cli" ? 1 : s.Method == "vscode" ? 2 : 0;
             LoadProfiles(s.ProfileKey);
-            LoadWindows(s.WindowTitle);
+            savedConvs = s.WindowConvs ?? new Dictionary<string, string>();
+            LoadWindows(s.WindowKeys, savedConvs);
+            tglNewChat.Checked = s.NewChat;
             fldUrl.Box.Text = s.Url;
             fldText.Box.Text = s.Text;
             cmbWhen.SelectedIndex = s.UseTime ? 1 : 0;
@@ -510,7 +693,11 @@ namespace ClaudeNotify
         {
             var s = new SchedConfig();
             s.Method = cmbMethod.SelectedIndex == 1 ? "cli" : cmbMethod.SelectedIndex == 2 ? "vscode" : "browser";
-            s.WindowTitle = SelectedWindowTitle();
+            s.WindowKeys = picker.SelectedKeys();
+            s.WindowTitle = s.WindowKeys.Count > 0 ? VsWindows.TitleOfKey(s.WindowKeys[0]) : "";
+            s.WindowConvs = picker.SelectedConvs();
+            foreach (var k in s.WindowKeys) { string sc; if (!s.WindowConvs.ContainsKey(k) && savedConvs.TryGetValue(k, out sc)) s.WindowConvs[k] = sc; }
+            s.NewChat = tglNewChat.Checked;
             int pi = cmbProfile.SelectedIndex;
             s.ProfileKey = pi >= 0 && pi < profiles.Count ? profiles[pi].Key : "";
             s.Url = fldUrl.Box.Text.Trim();
@@ -560,7 +747,8 @@ namespace ClaudeNotify
             {
                 var sc = SchedConfig.Load();
                 LoadProfiles(sc.ProfileKey);
-                LoadWindows(sc.WindowTitle);
+                savedConvs = sc.WindowConvs ?? new Dictionary<string, string>();
+                LoadWindows(sc.WindowKeys, savedConvs);
             }
             SetRunning(runner.Running);
         }

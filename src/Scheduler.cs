@@ -20,7 +20,10 @@ namespace ClaudeNotify
     class SchedConfig
     {
         public string Method { get; set; }          // "browser" = דרך הדפדפן, "cli" = דרך Claude Code בלי דפדפן, "vscode" = לחלון VS Code שנבחר
-        public string WindowTitle { get; set; }     // כותרת חלון ה-VS Code שנבחר (לשיטת "vscode")
+        public string WindowTitle { get; set; }     // ישן: כותרת חלון בודד. נשאר כדי שהגדרות ישנות ימשיכו לעבוד (נקרא כמפתח כותרת#0)
+        public List<string> WindowKeys { get; set; }   // חלונות ה-VS Code שנבחרו (לשיטת "vscode"), כל אחד כמפתח "כותרת#מספר"
+        public Dictionary<string, string> WindowConvs { get; set; }   // מפתח חלון -> כותרת השיחה שלו בזמן הבחירה, לזיהוי חלונות עם אותה כותרת
+        public bool NewChat { get; set; }           // true = לפתוח שיחה חדשה בכל חלון, false = להמשיך בשיחה הפעילה
         public string ProfileKey { get; set; }      // "Chrome|Profile 1"
         public string Url { get; set; }
         public string Text { get; set; }
@@ -40,6 +43,9 @@ namespace ClaudeNotify
         {
             Method = "browser";
             WindowTitle = "";
+            WindowKeys = new List<string>();
+            WindowConvs = new Dictionary<string, string>();
+            NewChat = true;
             ProfileKey = "";
             Url = "https://claude.ai/new";
             Text = "היי";
@@ -86,6 +92,9 @@ namespace ClaudeNotify
         {
             if (Method != "cli" && Method != "browser" && Method != "vscode") Method = "browser";
             if (WindowTitle == null) WindowTitle = "";
+            if (WindowKeys == null) WindowKeys = new List<string>();
+            if (WindowConvs == null) WindowConvs = new Dictionary<string, string>();
+            if (WindowKeys.Count == 0 && WindowTitle.Length > 0) WindowKeys.Add(VsWindows.Key(WindowTitle, 0));
             if (ProfileKey == null) ProfileKey = "";
             if (string.IsNullOrEmpty(Url)) Url = "https://claude.ai/new";
             if (Text == null) Text = "";
@@ -339,12 +348,157 @@ namespace ClaudeNotify
         }
     }
 
+    // ---------------------------------------------------------------- חלונות VS Code וכותרות שיחה
+    class VsWin
+    {
+        public long Handle;
+        public string Title;   // כותרת מנוקה מתווי כיווניות
+        public string Key;     // כותרת + "#" + מספר מופע בין החלונות עם אותה כותרת (לפי סדר Z)
+        public int Index, Count;
+        public string Conv = "";   // כותרת השיחה בחלון, אם זוהתה
+    }
+
+    static class VsWindows
+    {
+        public static string Key(string title, int index) { return title + "#" + index; }
+
+        public static string TitleOfKey(string key)
+        {
+            int i = key.LastIndexOf('#');
+            return i > 0 ? key.Substring(0, i) : key;
+        }
+
+        // מפתח בלי "#מספר" (הגדרה ישנה) נחשב כמופע הראשון
+        static string Norm(string key)
+        {
+            int i = key.LastIndexOf('#');
+            int n;
+            if (i > 0 && int.TryParse(key.Substring(i + 1), out n)) return key;
+            return key + "#0";
+        }
+
+        public static List<VsWin> List()
+        {
+            var res = new List<VsWin>();
+            var counts = new Dictionary<string, int>();
+            foreach (var w in WinApi.Find(Config.Load().ProcessList()))
+            {
+                string t = WinApi.CleanTitle(w.Title);
+                int n; counts.TryGetValue(t, out n);
+                counts[t] = n + 1;
+                res.Add(new VsWin { Handle = w.Handle, Title = t, Index = n, Key = Key(t, n) });
+            }
+            foreach (var w in res) w.Count = counts[w.Title];
+            return res;
+        }
+
+        // מפתח -> חלון נוכחי. כשיש כמה חלונות עם אותה כותרת ונשמרה כותרת שיחה - מעדיפים את החלון שמציג אותה
+        public static VsWin Resolve(List<VsWin> wins, string key, string conv)
+        {
+            key = Norm(key);
+            string title = TitleOfKey(key);
+            var same = new List<VsWin>();
+            foreach (var w in wins) if (w.Title == title) same.Add(w);
+            if (same.Count == 0) return null;
+            if (same.Count > 1 && !string.IsNullOrEmpty(conv))
+            {
+                foreach (var w in same)
+                    if (ConvTitles.HasTitle(w.Handle, conv)) return w;
+            }
+            foreach (var w in same) if (w.Key == key) return w;
+            return null;
+        }
+
+        public static string LabelOf(long handle)
+        {
+            foreach (var w in List())
+                if (w.Handle == handle) return w.Count > 1 ? w.Title + " (" + (w.Index + 1) + ")" : w.Title;
+            return "";
+        }
+    }
+
+    // כותרת השיחה (aiTitle) מוצגת בפאנל של Claude בכל חלון ככפתור ששמו הכותרת. מחפשים כפתורים ששמם שווה לכותרת ידועה מהתמלולים
+    static class ConvTitles
+    {
+        static readonly Dictionary<string, KeyValuePair<DateTime, string>> cache = new Dictionary<string, KeyValuePair<DateTime, string>>();
+
+        // כותרות השיחות של הקבצים האחרונים בתיקיית התמלולים (עם מטמון לפי זמן שינוי)
+        public static HashSet<string> Known()
+        {
+            var set = new HashSet<string>();
+            try
+            {
+                string root = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), @".claude\projects");
+                if (!Directory.Exists(root)) return set;
+                var files = new List<FileInfo>();
+                foreach (var f in Directory.GetFiles(root, "*.jsonl", SearchOption.AllDirectories)) files.Add(new FileInfo(f));
+                files.Sort(delegate(FileInfo a, FileInfo b) { return b.LastWriteTimeUtc.CompareTo(a.LastWriteTimeUtc); });
+                for (int i = 0; i < files.Count && i < 120; i++)
+                {
+                    string t = null;
+                    lock (cache)
+                    {
+                        KeyValuePair<DateTime, string> kv;
+                        if (cache.TryGetValue(files[i].FullName, out kv) && kv.Key == files[i].LastWriteTimeUtc) t = kv.Value;
+                    }
+                    if (t == null)
+                    {
+                        t = TextUtil.TitleFromTranscript(files[i].FullName);
+                        lock (cache) cache[files[i].FullName] = new KeyValuePair<DateTime, string>(files[i].LastWriteTimeUtc, t);
+                    }
+                    if (t.Length > 0) set.Add(t);
+                }
+            }
+            catch (Exception ex) { Log.Write("conv titles: " + ex.Message); }
+            return set;
+        }
+
+        // כותרת השיחה המוצגת בחלון, או "" אם לא זוהתה
+        public static string ForWindow(long hwnd, HashSet<string> known)
+        {
+            try
+            {
+                var root = AutomationElement.FromHandle(new IntPtr(hwnd));
+                var cr = new CacheRequest();
+                cr.Add(AutomationElement.NameProperty);
+                cr.Add(AutomationElement.IsOffscreenProperty);
+                var cond = new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Button);
+                AutomationElementCollection all;
+                using (cr.Activate()) all = root.FindAll(TreeScope.Descendants, cond);
+                string found = "";
+                foreach (AutomationElement e in all)
+                {
+                    string n = e.Cached.Name;
+                    if (string.IsNullOrEmpty(n) || !known.Contains(n)) continue;
+                    if (!e.Cached.IsOffscreen) return n;
+                    if (found.Length == 0) found = n;
+                }
+                return found;
+            }
+            catch (Exception ex) { Log.Write("conv title uia: " + ex.Message); }
+            return "";
+        }
+
+        public static bool HasTitle(long hwnd, string title)
+        {
+            try
+            {
+                var root = AutomationElement.FromHandle(new IntPtr(hwnd));
+                var cond = new AndCondition(
+                    new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Button),
+                    new PropertyCondition(AutomationElement.NameProperty, title));
+                return root.FindFirst(TreeScope.Descendants, cond) != null;
+            }
+            catch { return false; }
+        }
+    }
+
     // ---------------------------------------------------------------- Schedule runner
     // רץ כולו על ה-thread של הממשק (טיימר אחד), כמו ב-tkinter של הסקריפט המקורי.
     // הוא שייך ל-TrayContext ולא לחלון, ולכן סגירת החלון לא מבטלת את התזמון.
     class ScheduleRunner
     {
-        enum Phase { Idle, WaitStart, WaitPage, Typing, Done, Sending, VsInput, VsEnter, VsVerify }
+        enum Phase { Idle, WaitStart, WaitPage, Typing, Done, Sending, VsInput, VsEnter, VsVerify, VsGap }
         class FocusLost : Exception { }
 
         // בודק דרך UI Automation של Windows אם הפוקוס נמצא בתוך דף אינטרנט (רכיב Document) ולא בשורת הכתובת.
@@ -382,6 +536,10 @@ try {
         int checkFailures, runId;
         IntPtr browserHwnd;
         long vsHandle;
+        List<long> vsQueue = new List<long>();      // חלונות שעוד לא טופלו (לפי הסדר)
+        List<string> vsFailed = new List<string>();
+        int vsTotal, vsOk, vsIndex;
+        string vsLabel = "", vsFirstErr = "";
         bool taskRegistered;
         DateTime vsStart;
         int vsTries, vsPasteTries;
@@ -418,7 +576,7 @@ try {
             if (Running) return "כבר יש תזמון פעיל";
             profile = null;
             if (string.IsNullOrWhiteSpace(cfg.Text)) return "צריך להקליד טקסט לשליחה";
-            if (cfg.Method == "vscode" && string.IsNullOrEmpty(cfg.WindowTitle)) return "צריך לבחור חלון VS Code (אם הרשימה ריקה - פתח את החלון ולחץ על הכפתור 'רענן')";
+            if (cfg.Method == "vscode" && (cfg.WindowKeys == null || cfg.WindowKeys.Count == 0) && string.IsNullOrEmpty(cfg.WindowTitle)) return "צריך לבחור לפחות חלון VS Code אחד (אם הרשימה ריקה - פתח את החלון ולחץ על הכפתור 'רענן')";
             if (cfg.Method == "browser")
             {
                 foreach (var p in BrowserProfiles.List()) if (p.Key == cfg.ProfileKey) profile = p;
@@ -498,14 +656,21 @@ try {
                     case Phase.VsInput: VsFillInput(); break;
                     case Phase.VsEnter: VsPressEnter(); break;
                     case Phase.VsVerify: VsVerify(); break;
-                    case Phase.Done: RestoreClipboard(); Finish("בוצע!", false); break;
+                    case Phase.VsGap: VsNext(); break;
+                    case Phase.Done:
+                        RestoreClipboard();
+                        if (c.Method == "vscode") VsAdvance(true, null);
+                        else Finish("בוצע!", false);
+                        break;
                 }
             }
             catch (Exception ex)
             {
                 Log.Write("schedule error: " + ex);
                 RestoreClipboard();
-                Finish("שגיאה לא צפויה: " + ex.Message, true);
+                // תקלה בחלון אחד לא עוצרת את שאר החלונות
+                if (c != null && c.Method == "vscode" && phase != Phase.Idle) VsAdvance(false, "שגיאה לא צפויה: " + ex.Message);
+                else Finish("שגיאה לא צפויה: " + ex.Message, true);
             }
         }
 
@@ -548,40 +713,139 @@ try {
             Countdown(TryType);
         }
 
-        // ---- שליחה לחלון VS Code מסוים ----
-        // מעלים את החלון שנבחר לחזית, ופותחים בו שיחה חדשה עם הטקסט דרך הכתובת vscode://anthropic.claude-code/open?prompt=...
-        // (התוסף של Claude Code תומך בה). אחרי כמה שניות לוחצים Enter כדי לשלוח, למקרה שהטקסט רק הוכנס לתיבה
+        // ---- שליחה לחלונות VS Code שנבחרו ----
+        // עוברים על החלונות אחד אחד: מעלים את החלון לחזית, פותחים בו שיחה חדשה דרך הכתובת vscode://anthropic.claude-code/open
+        // (או ממשיכים בשיחה הפעילה), מדביקים את הטקסט ב"Message input" ולוחצים Enter. כשל בחלון אחד לא עוצר את האחרים
         void SendToVsCodeWindow()
         {
             Power.WakeDisplay();
             if (Power.IsLocked()) { Finish("המחשב היה נעול בשעת ההפעלה, ולכן לא נעשה כלום", true); return; }
+            VsBegin();
+        }
 
-            var found = FindVsWindow(c.WindowTitle);
-            if (found == null) { Finish("חלון ה-VS Code שנבחר (\"" + c.WindowTitle + "\") כבר לא פתוח, ולכן לא נשלח כלום", true); return; }
-            string scheme = WinApi.SchemeFor(found.Handle);
-            if (scheme == null) { Finish("לא הצלחתי לזהות איזה עורך זה (Code או Cursor)", true); return; }
-
+        void VsBegin()
+        {
+            vsQueue = new List<long>();
+            vsFailed = new List<string>();
+            vsOk = 0; vsIndex = 0; vsFirstErr = "";
+            var keys = c.WindowKeys;
+            if (keys == null || keys.Count == 0)
+            {
+                keys = new List<string>();
+                if (!string.IsNullOrEmpty(c.WindowTitle)) keys.Add(VsWindows.Key(c.WindowTitle, 0));
+            }
+            var wins = VsWindows.List();
+            var seen = new HashSet<long>();
+            var missing = new List<string>();
+            foreach (var k in keys)
+            {
+                string conv = null;
+                if (c.WindowConvs != null) c.WindowConvs.TryGetValue(k, out conv);
+                var w = VsWindows.Resolve(wins, k, conv);
+                if (w == null || !seen.Add(w.Handle)) { if (w == null) missing.Add(VsWindows.TitleOfKey(k)); continue; }
+                vsQueue.Add(w.Handle);
+            }
+            vsTotal = vsQueue.Count + missing.Count;
+            if (vsQueue.Count == 0)
+            {
+                if (missing.Count == 1) Finish("חלון ה-VS Code שנבחר (\"" + missing[0] + "\") כבר לא פתוח, ולכן לא נשלח כלום", true);
+                else Finish("חלונות ה-VS Code שנבחרו כבר לא פתוחים, ולכן לא נשלח כלום", true);
+                return;
+            }
+            foreach (var m in missing) vsFailed.Add(m + " - " + L.Tr("החלון כבר לא פתוח"));
+            if (missing.Count > 0) vsFirstErr = "החלון כבר לא פתוח";
             if (Launching != null) Launching();   // החלון שלנו נעלם כדי שלא יגנוב פוקוס
-            if (!WinApi.Focus(found.Handle)) { Finish("לא הצלחתי להעלות את חלון ה-VS Code לחזית (Windows חסם), ולכן לא נשלח כלום", true); return; }
-            Thread.Sleep(500); // ל-VS Code לוקח רגע לרשום שזה החלון הפעיל, ושם ה-URI מנותב
-            if (Native.GetForegroundWindow().ToInt64() != found.Handle) { Finish("החלון שנבחר איבד פוקוס לפני השליחה, ולכן לא נשלח כלום", true); return; }
+            VsNext();
+        }
 
-            vsHandle = found.Handle;
+        void VsStatus(string text)
+        {
+            SetStatus(vsTotal > 1 ? "[" + vsIndex + "/" + vsTotal + "] " + text : text, false);
+        }
+
+        // לוקח את החלון הבא מהתור ומתחיל בו
+        void VsNext()
+        {
+            if (vsQueue.Count == 0) { VsFinishAll(); return; }
+            long h = vsQueue[0];
+            vsQueue.RemoveAt(0);
+            vsIndex = vsOk + vsFailed.Count + 1;
+            vsLabel = VsWindows.LabelOf(h);
+            string scheme = WinApi.SchemeFor(h);
+            if (scheme == null) { VsAdvance(false, "לא הצלחתי לזהות איזה עורך זה (Code או Cursor)"); return; }
+            if (!WinApi.Focus(h)) { VsAdvance(false, "לא הצלחתי להעלות את חלון ה-VS Code לחזית (Windows חסם), ולכן לא נשלח כלום"); return; }
+            Thread.Sleep(500); // ל-VS Code לוקח רגע לרשום שזה החלון הפעיל, ושם ה-URI מנותב
+            if (Native.GetForegroundWindow().ToInt64() != h) { VsAdvance(false, "החלון שנבחר איבד פוקוס לפני השליחה, ולכן לא נשלח כלום"); return; }
+
+            vsHandle = h;
+            vsInput = null;
             vsStart = DateTime.Now.AddSeconds(-2);
             vsTries = 0;
             vsPasteTries = 0;
-            vsOldInputs = CurrentInputs(found.Handle);
-            vsNewInputUntil = DateTime.Now.AddSeconds(8);   // 8 שניות ראשונות: מחכים לתיבה של השיחה החדשה ולא נוגעים בתיבות שהיו קודם
-            vsDeadline = DateTime.Now.AddSeconds(30);
             oldClip = ReadClipboard();
-            var psi = new ProcessStartInfo(scheme + "://anthropic.claude-code/open");
-            psi.UseShellExecute = true;
-            Process.Start(psi);
-            Log.Write("schedule: opened prompt in window [" + found.Title + "]");
+            if (c.NewChat)
+            {
+                vsOldInputs = CurrentInputs(h);
+                vsNewInputUntil = DateTime.Now.AddSeconds(8);   // 8 שניות ראשונות: מחכים לתיבה של השיחה החדשה ולא נוגעים בתיבות שהיו קודם
+                vsDeadline = DateTime.Now.AddSeconds(30);
+                var psi = new ProcessStartInfo(scheme + "://anthropic.claude-code/open");
+                psi.UseShellExecute = true;
+                Process.Start(psi);
+                Log.Write("schedule: opened new chat in window [" + vsLabel + "]");
+                phase = Phase.VsInput;
+                VsStatus("ממתין שהשיחה תיפתח בחלון...");
+                Next(2500);
+            }
+            else
+            {
+                // ממשיכים בשיחה הפעילה: משתמשים בתיבה שכבר גלויה (עדיפות לזו שבפוקוס)
+                vsOldInputs = new HashSet<string>();
+                vsNewInputUntil = DateTime.Now;
+                vsDeadline = DateTime.Now.AddSeconds(15);
+                Log.Write("schedule: continuing active chat in window [" + vsLabel + "]");
+                phase = Phase.VsInput;
+                VsStatus("מחפש את תיבת ההקלדה בחלון...");
+                Next(300);
+            }
+        }
 
-            phase = Phase.VsInput;
-            SetStatus("ממתין שהשיחה תיפתח בחלון...", false);
-            Next(2500);
+        // רושם את תוצאת החלון הנוכחי וממשיך לבא אחריו (אחרי הפסקה קצרה), או מסיים
+        void VsAdvance(bool ok, string err)
+        {
+            timer.Stop();
+            RestoreClipboard();
+            vsInput = null;
+            if (ok) vsOk++;
+            else
+            {
+                Log.Write("schedule: window [" + vsLabel + "] failed: " + err);
+                if (vsFirstErr.Length == 0) vsFirstErr = err;
+                vsFailed.Add(vsLabel + " - " + L.Tr(err));
+            }
+            if (vsQueue.Count > 0)
+            {
+                phase = Phase.VsGap;
+                VsStatus("ממתין לפני החלון הבא...");
+                Next(3000);
+                return;
+            }
+            VsFinishAll();
+        }
+
+        void VsFinishAll()
+        {
+            if (vsTotal <= 1)
+            {
+                if (vsFailed.Count == 0) Finish("בוצע!", false);
+                else
+                {
+                    Finish(vsFirstErr, true);
+                }
+                return;
+            }
+            string head = L.T("נשלח ל-" + vsOk + " מתוך " + vsTotal + " חלונות", "Sent to " + vsOk + " of " + vsTotal + " windows");
+            if (vsFailed.Count == 0) Finish(L.T("בוצע! ", "Done! ") + head, false);
+            else Finish(head + L.T(". נכשל: ", ". Failed: ") + string.Join(" | ", vsFailed.ToArray()), true);
         }
 
         // ---- מילוי תיבת ההקלדה של Claude בחלון שנבחר ----
@@ -596,7 +860,7 @@ try {
             catch (Exception ex) { Log.Write("uia error: " + ex.Message); }
             if (input == null)
             {
-                if (DateTime.Now > vsDeadline) { Finish("לא מצאתי תיבת הקלדה של Claude בחלון שנבחר, ולכן לא נשלח כלום", true); return; }
+                if (DateTime.Now > vsDeadline) { VsAdvance(false, "לא מצאתי תיבת הקלדה של Claude בחלון שנבחר, ולכן לא נשלח כלום"); return; }
                 Next(1000);
                 return;
             }
@@ -615,7 +879,7 @@ try {
                     Thread.Sleep(500);
                 }
             }
-            catch (FocusLost) { Finish("חלון אחר קפץ לחזית לפני ההקלדה, ולכן לא נשלח כלום", true); return; }
+            catch (FocusLost) { VsAdvance(false, "חלון אחר קפץ לחזית לפני ההקלדה, ולכן לא נשלח כלום"); return; }
 
             string val = InputValue(input);
             if (val != null && Norm(val) == Norm(c.Text))
@@ -628,7 +892,7 @@ try {
             }
             vsPasteTries++;
             Log.Write("schedule: paste attempt " + vsPasteTries + " value=[" + val + "]");
-            if (vsPasteTries >= 4) { Finish("מצאתי את תיבת ההקלדה אבל לא הצלחתי להכניס אליה את הטקסט, ולכן לא נשלח כלום", true); return; }
+            if (vsPasteTries >= 4) { VsAdvance(false, "מצאתי את תיבת ההקלדה אבל לא הצלחתי להכניס אליה את הטקסט, ולכן לא נשלח כלום"); return; }
             Next(1000);
         }
 
@@ -679,11 +943,11 @@ try {
 
         void VsPressEnter()
         {
-            if (Power.IsLocked()) { Finish("המחשב ננעל לפני השליחה. הטקסט הוכנס לחלון אבל לא נשלח", true); return; }
+            if (Power.IsLocked()) { VsAdvance(false, "המחשב ננעל לפני השליחה. הטקסט הוכנס לחלון אבל לא נשלח"); return; }
             browserHwnd = new IntPtr(vsHandle);
             if (Native.GetForegroundWindow() != browserHwnd) WinApi.Focus(vsHandle);
             try { Key(VK_RETURN, false, false); }
-            catch (FocusLost) { Finish("חלון אחר קפץ לחזית לפני השליחה. הטקסט הוכנס לחלון אבל לא נשלח", true); return; }
+            catch (FocusLost) { VsAdvance(false, "חלון אחר קפץ לחזית לפני השליחה. הטקסט הוכנס לחלון אבל לא נשלח"); return; }
             vsTries++;
             if (vsTries == 1) vsEnterAt = DateTime.Now;
             phase = Phase.VsVerify;
@@ -703,7 +967,7 @@ try {
             bool stillInBox = val != null && Norm(val) == Norm(c.Text);
             if (stillInBox)
             {
-                if (vsTries >= 3) { Finish("לחצתי Enter, אבל ההודעה נשארה בתיבה ולא נשלחה. בדוק בחלון ה-VS Code", true); return; }
+                if (vsTries >= 3) { VsAdvance(false, "לחצתי Enter, אבל ההודעה נשארה בתיבה ולא נשלחה. בדוק בחלון ה-VS Code"); return; }
                 Log.Write("schedule: text still in the input after Enter " + vsTries + ", pressing again");
                 phase = Phase.VsEnter;
                 Next(200);
@@ -742,6 +1006,11 @@ try {
                             {
                                 var o = ser.Deserialize<Dictionary<string, object>>(line);
                                 if (TextUtil.Str(o, "type") != "user") continue;
+                                // הודעה זהה שנשלחה קודם (למשל לחלון הקודם בתור) לא נחשבת
+                                DateTime ts;
+                                if (DateTime.TryParse(TextUtil.Str(o, "timestamp"), System.Globalization.CultureInfo.InvariantCulture,
+                                    System.Globalization.DateTimeStyles.AdjustToUniversal | System.Globalization.DateTimeStyles.AssumeUniversal, out ts)
+                                    && ts < since.ToUniversalTime()) continue;
                                 var msg = o["message"] as Dictionary<string, object>;
                                 if (msg == null) continue;
                                 object content = msg["content"];
@@ -761,14 +1030,6 @@ try {
             }
             catch (Exception ex) { Log.Write("verify error: " + ex.Message); }
             return false;
-        }
-
-        // מחפש לפי הכותרת המנוקה מתווי כיווניות. אם יש כמה חלונות עם אותה כותרת - לוקח את העליון
-        public static WinInfo FindVsWindow(string title)
-        {
-            foreach (var w in WinApi.Find(Config.Load().ProcessList()))
-                if (WinApi.CleanTitle(w.Title) == title) return w;
-            return null;
         }
 
         // ---- שליחה דרך Claude Code (בלי דפדפן) ----
@@ -996,6 +1257,7 @@ try {
             timer.Stop();
             RestoreClipboard();
             phase = Phase.Idle;
+            vsQueue.Clear();
             runId++;
             Power.Release();
             awakeOn = false;

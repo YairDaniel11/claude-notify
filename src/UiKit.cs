@@ -23,7 +23,11 @@ namespace ClaudeNotify
         {
             new[] { "כבר יש תזמון פעיל", "A schedule is already running" },
             new[] { "צריך להקליד טקסט לשליחה", "Type the text to send" },
-            new[] { "צריך לבחור חלון VS Code (אם הרשימה ריקה - פתח את החלון ולחץ על הכפתור 'רענן')", "Choose a VS Code window (if the list is empty, open the window and press Refresh)" },
+            new[] { "צריך לבחור לפחות חלון VS Code אחד (אם הרשימה ריקה - פתח את החלון ולחץ על הכפתור 'רענן')", "Choose at least one VS Code window (if the list is empty, open the window and press Refresh)" },
+            new[] { "חלונות ה-VS Code שנבחרו כבר לא פתוחים, ולכן לא נשלח כלום", "The chosen VS Code windows are no longer open, so nothing was sent" },
+            new[] { "החלון כבר לא פתוח", "The window is no longer open" },
+            new[] { "ממתין לפני החלון הבא...", "Waiting before the next window..." },
+            new[] { "מחפש את תיבת ההקלדה בחלון...", "Looking for the input box in the window..." },
             new[] { "צריך לבחור פרופיל של Chrome, Edge או Brave", "Choose a Chrome, Edge or Brave profile" },
             new[] { "כתובת האתר חייבת להתחיל ב-https://", "The address must start with https://" },
             new[] { "השעה לא תקינה", "Invalid time" },
@@ -339,9 +343,9 @@ namespace ClaudeNotify
         {
             BackColor = Theme.Bg;
             extra = extraControl;
-            logo.Image = Branding.MakeBitmap(Theme.S(36));
+            logo.Image = Branding.MakeLogo(Theme.S(30));
             logo.SizeMode = PictureBoxSizeMode.Normal;
-            logo.Size = new Size(Theme.S(36), Theme.S(36));
+            logo.Size = logo.Image.Size;
             logo.BackColor = Theme.Bg;
             title.AutoSize = false; title.Text = t; title.Font = Theme.Semi(16f); title.ForeColor = Theme.Text; title.BackColor = Theme.Bg;
             sub.AutoSize = false; sub.Text = s; sub.Font = Theme.F(9.5f); sub.ForeColor = Theme.Muted; sub.BackColor = Theme.Bg;
@@ -363,14 +367,14 @@ namespace ClaudeNotify
         {
             Width = width;
             bool rtl = L.He;
-            int logoW = Theme.S(36), gap = Theme.S(14);
+            int logoW = logo.Width, gap = Theme.S(14);
             int extraW = extra != null ? extra.Width + gap : 0;
             int textW = width - logoW - gap - extraW;
             title.RightToLeft = sub.RightToLeft = rtl ? RightToLeft.Yes : RightToLeft.No;
             title.TextAlign = sub.TextAlign = ContentAlignment.TopLeft;
             int sh = Theme.TextHeight(sub.Text, sub.Font, textW, rtl);
             int th = Theme.S(30);
-            Height = Math.Max(logoW + 4, th + sh) + 4;
+            Height = Math.Max(logo.Height + 4, th + sh) + 4;
             int tx = rtl ? width - logoW - gap - textW : logoW + gap;
             logo.Location = new Point(rtl ? width - logoW : 0, 0);
             title.SetBounds(tx, 0, textW, th);

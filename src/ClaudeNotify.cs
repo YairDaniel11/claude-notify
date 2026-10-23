@@ -31,7 +31,7 @@ namespace ClaudeNotify
             try { SetProcessDPIAware(); } catch { }   // ממשק חד במסכים עם סקאלה, במקום תמונה מתוחה ומטושטשת
             if (a0 == "--make-icon")
             {
-                using (var fs = File.Create(args[1])) Branding.MakeIcon(32).Save(fs);
+                using (var fs = File.Create(args[1])) Branding.WriteIco(fs, new[] { 16, 24, 32, 48, 64 });
                 return;
             }
             if (a0 == "--notify") { NotifyClient.Run(); return; }
@@ -60,7 +60,61 @@ namespace ClaudeNotify
     // ---------------------------------------------------------------- Branding
     static class Branding
     {
-        // מצייר את הסמל בגודל המדויק שנדרש, כדי שיהיה חד גם כשמגדילים אותו בממשק
+        static readonly Color Orange = Color.FromArgb(217, 119, 87);
+
+        // בועת שיחה לבנה קטנה עם זנב, שמסמלת הודעת פוש. dots = שלוש נקודות כתומות בתוכה (רק כשהיא גדולה מספיק)
+        static void DrawBubble(Graphics g, RectangleF r, bool dots) { DrawBubble(g, r, dots, Color.White); }
+
+        static void DrawBubble(Graphics g, RectangleF r, bool dots, Color fill)
+        {
+            float tail = r.Height * 0.28f;
+            var body = new RectangleF(r.X, r.Y, r.Width, r.Height - tail);
+            using (var path = Theme.RoundRect(body, body.Height * 0.38f))
+            using (var b = new SolidBrush(fill))
+            {
+                g.FillPath(b, path);
+                g.FillPolygon(b, new[]
+                {
+                    new PointF(r.X + r.Width * 0.18f, body.Bottom - 1),
+                    new PointF(r.X + r.Width * 0.18f, r.Bottom),
+                    new PointF(r.X + r.Width * 0.46f, body.Bottom - 1)
+                });
+            }
+            if (!dots) return;
+            float d = body.Height * 0.17f, cy = body.Y + body.Height / 2f;
+            using (var b = new SolidBrush(Orange))
+                for (int i = -1; i <= 1; i++)
+                    g.FillEllipse(b, body.X + body.Width / 2f + i * d * 2.2f - d / 2f, cy - d / 2f, d, d);
+        }
+
+        // לוגו רחב לכותרות: "Claude" בלבן על רקע כתום, ומימין לו בועת שיחה לבנה
+        public static Bitmap MakeLogo(int height)
+        {
+            using (var probe = new Bitmap(1, 1))
+            using (var pg = Graphics.FromImage(probe))
+            using (var f = new Font("Segoe UI", height * 0.46f, FontStyle.Bold, GraphicsUnit.Pixel))
+            {
+                float pad = height * 0.34f, gap = height * 0.18f, bw = height * 0.52f;
+                float tw = pg.MeasureString("Claude", f, 1000, StringFormat.GenericTypographic).Width;
+                int w = (int)Math.Ceiling(pad + tw + gap + bw + pad);
+                var bmp = new Bitmap(w, height);
+                using (var g = Graphics.FromImage(bmp))
+                {
+                    g.SmoothingMode = SmoothingMode.AntiAlias;
+                    g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.AntiAliasGridFit;
+                    g.Clear(Color.Transparent);
+                    using (var path = Theme.RoundRect(new RectangleF(0.5f, 0.5f, w - 1, height - 1), height * 0.3f))
+                    using (var b = new SolidBrush(Orange))
+                        g.FillPath(b, path);
+                    float ty = (height - f.Size * 1.2f) / 2f;
+                    g.DrawString("Claude", f, Brushes.White, pad, ty, StringFormat.GenericTypographic);
+                    DrawBubble(g, new RectangleF(pad + tw + gap, height * 0.22f, bw, height * 0.56f), height >= 24);
+                }
+                return bmp;
+            }
+        }
+
+        // סמל מרובע (אייקון תוכנה, שורת משימות, כותרת חלון): ריבוע כתום עם "Claude" או "C" בלבן, ובועת שיחה בפינה
         public static Bitmap MakeBitmap(int size)
         {
             var bmp = new Bitmap(size, size);
@@ -69,21 +123,90 @@ namespace ClaudeNotify
                 g.SmoothingMode = SmoothingMode.AntiAlias;
                 g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.AntiAlias;
                 g.Clear(Color.Transparent);
-                using (var b = new SolidBrush(Color.FromArgb(217, 119, 87)))
-                    g.FillEllipse(b, 0.5f, 0.5f, size - 1, size - 1);
-                using (var f = new Font("Segoe UI", size * 0.56f, FontStyle.Bold, GraphicsUnit.Pixel))
-                using (var sf = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center })
-                    g.DrawString("C", f, Brushes.White, new RectangleF(0, size * 0.02f, size, size), sf);
+                using (var path = Theme.RoundRect(new RectangleF(0.5f, 0.5f, size - 1, size - 1), size * 0.24f))
+                using (var b = new SolidBrush(Orange))
+                    g.FillPath(b, path);
+                bool full = size >= 48;   // רק בגדלים גדולים יש מקום למילה המלאה
+                if (full)
+                {
+                    using (var f = new Font("Segoe UI", size * 0.2f, FontStyle.Bold, GraphicsUnit.Pixel))
+                    using (var sf = new StringFormat(StringFormat.GenericTypographic) { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center })
+                        g.DrawString("Claude", f, Brushes.White, new RectangleF(0, size * 0.36f, size, size * 0.5f), sf);
+                    float bs = size * 0.3f;
+                    DrawBubble(g, new RectangleF(size - bs - size * 0.1f, size * 0.08f, bs, bs * 0.9f), true);
+                }
+                else
+                {
+                    // קטן (שורת משימות, כותרת חלון): C גיאומטרית עבה בלבן, ונקודת התראה לבנה בפינה
+                    float cx = size * 0.46f, cy = size * 0.54f, R = size * 0.26f;
+                    using (var pen = new Pen(Color.White, size * 0.17f) { StartCap = LineCap.Round, EndCap = LineCap.Round })
+                        g.DrawArc(pen, cx - R, cy - R, R * 2, R * 2, 38, 284);
+                    // בועת שיחה קטנה בפינה (עם מסגרת כתומה שמפרידה אותה מה-C)
+                    float bw = size * 0.44f, bh = size * 0.40f, bx = size * 0.52f, by = size * 0.04f, o = size * 0.05f;
+                    DrawBubble(g, new RectangleF(bx - o, by - o, bw + o * 2, bh + o * 2 + 0.5f), false, Orange);
+                    DrawBubble(g, new RectangleF(bx, by, bw, bh), false, Color.White);
+                }
             }
             return bmp;
+        }
+
+        // קובץ ICO עם כמה גדלים (פורמט BMP בן 32 סיביות, שתואם גם ל-csc הישן). Icon.Save של סמל שנוצר מ-GetHicon מאבד את הצבעים
+        public static void WriteIco(Stream fs, int[] sizes)
+        {
+            var bw = new BinaryWriter(fs);
+            var datas = new List<byte[]>();
+            foreach (int size in sizes)
+                using (var bmp = MakeBitmap(size)) datas.Add(Dib(bmp));
+            bw.Write((short)0); bw.Write((short)1); bw.Write((short)sizes.Length);
+            int offset = 6 + 16 * sizes.Length;
+            for (int i = 0; i < sizes.Length; i++)
+            {
+                bw.Write((byte)sizes[i]); bw.Write((byte)sizes[i]); bw.Write((byte)0); bw.Write((byte)0);
+                bw.Write((short)1); bw.Write((short)32); bw.Write(datas[i].Length); bw.Write(offset);
+                offset += datas[i].Length;
+            }
+            foreach (var d in datas) bw.Write(d);
+            bw.Flush();
+        }
+
+        static byte[] Dib(Bitmap b)
+        {
+            int w = b.Width, h = b.Height;
+            var ms = new MemoryStream();
+            var bw = new BinaryWriter(ms);
+            bw.Write(40); bw.Write(w); bw.Write(h * 2); bw.Write((short)1); bw.Write((short)32);
+            bw.Write(0); bw.Write(0); bw.Write(0); bw.Write(0); bw.Write(0); bw.Write(0);
+            for (int y = h - 1; y >= 0; y--)
+                for (int x = 0; x < w; x++)
+                {
+                    Color c = b.GetPixel(x, y);
+                    bw.Write(c.B); bw.Write(c.G); bw.Write(c.R); bw.Write(c.A);
+                }
+            bw.Write(new byte[((w + 31) / 32) * 4 * h]);
+            return ms.ToArray();
+        }
+
+        static Icon appIcon;
+
+        // סמל התוכנה בכמה גדלים: Windows בוחר לבד את המתאים (שורת משימות, כותרת חלון, אייקון ליד השעון)
+        public static Icon AppIcon
+        {
+            get
+            {
+                if (appIcon == null)
+                {
+                    var ms = new MemoryStream();
+                    WriteIco(ms, new[] { 16, 20, 24, 32, 40, 48, 64 });
+                    ms.Position = 0;
+                    appIcon = new Icon(ms);
+                }
+                return appIcon;
+            }
         }
 
         public static Icon MakeIcon(int size)
         {
             return Icon.FromHandle(MakeBitmap(size).GetHicon());
-        }
-    }
-            return Icon.FromHandle(bmp.GetHicon());
         }
     }
 
@@ -694,7 +817,7 @@ namespace ClaudeNotify
             get { return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), @".claude\settings.json"); }
         }
 
-        static Dictionary<string, object> ReadSettings()
+        internal static Dictionary<string, object> ReadSettings()
         {
             var ser = new JavaScriptSerializer { MaxJsonLength = int.MaxValue };
             if (File.Exists(SettingsPath))
@@ -705,7 +828,7 @@ namespace ClaudeNotify
             return new Dictionary<string, object>();
         }
 
-        static void WriteSettings(Dictionary<string, object> root)
+        internal static void WriteSettings(Dictionary<string, object> root)
         {
             Directory.CreateDirectory(Path.GetDirectoryName(SettingsPath));
             if (File.Exists(SettingsPath)) File.Copy(SettingsPath, SettingsPath + ".bak", true);
@@ -833,6 +956,7 @@ namespace ClaudeNotify
         SettingsForm settings;
         readonly ScheduleRunner sched;
         ScheduleForm schedForm;
+        UsageForm usageForm;
         long lastTarget;
         string lastSession = "";
 
@@ -849,7 +973,7 @@ namespace ClaudeNotify
             sched.Finished += OnSchedFinished;
 
             tray = new NotifyIcon();
-            tray.Icon = Branding.MakeIcon(32);
+            tray.Icon = new Icon(Branding.AppIcon, SystemInformation.SmallIconSize);
             tray.Text = "Claude Notify";
             enabledItem = new ToolStripMenuItem();
             enabledItem.Click += delegate { cfg.Enabled = !cfg.Enabled; cfg.Save(); SyncEnabled(); };
@@ -877,14 +1001,16 @@ namespace ClaudeNotify
         {
             var menu = new ContextMenuStrip();
             menu.RightToLeft = L.He ? RightToLeft.Yes : RightToLeft.No;
-            menu.Font = new Font("Segoe UI", 12f);
+            
             menu.Items.Add(L.T("הגדרות...", "Settings..."), null, delegate { ShowSettings(); });
             enabledItem.Text = L.T("התראות פעילות", "Notifications on");
             menu.Items.Add(enabledItem);
             menu.Items.Add(L.T("התראת בדיקה", "Test notification"), null, delegate { TestNotification(); });
             menu.Items.Add(L.T("הודעה מתוזמנת (פתיחת מכסה)...", "Scheduled message (start quota)..."), null, delegate { ShowSchedule(); });
+            menu.Items.Add(L.T("מידע טכני...", "Technical info..."), null, delegate { ShowUsage(); });
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add(L.T("יציאה", "Exit"), null, delegate { sched.Cancel(); tray.Visible = false; Application.Exit(); });
+            MenuStyle.Apply(menu);
             tray.ContextMenuStrip = menu;
         }
 
@@ -916,6 +1042,15 @@ namespace ClaudeNotify
             }
         }
 
+        public void ShowUsage()
+        {
+            if (usageForm == null || usageForm.IsDisposed) usageForm = new UsageForm();
+            usageForm.Reload();
+            usageForm.Show();
+            usageForm.WindowState = FormWindowState.Normal;
+            usageForm.Activate();
+        }
+
         public void ShowSchedule()
         {
             if (schedForm == null || schedForm.IsDisposed) schedForm = new ScheduleForm(sched);
@@ -939,6 +1074,7 @@ namespace ClaudeNotify
                 UpdateTrayText();
                 if (settings != null) { settings.Dispose(); settings = null; }
                 if (schedForm != null) { schedForm.Dispose(); schedForm = null; }
+                if (usageForm != null) { usageForm.Dispose(); usageForm = null; }
                 ShowSettings();
             }));
         }
@@ -987,6 +1123,7 @@ namespace ClaudeNotify
             {
                 if (TextUtil.Str(j, "__cmd") == "settings") ShowSettings();
                 if (TextUtil.Str(j, "__cmd") == "schedule") ShowSchedule();
+                if (TextUtil.Str(j, "__cmd") == "usage") ShowUsage();
                 return;
             }
             if (!cfg.Enabled) { Log.Write("skipped: disabled"); return; }

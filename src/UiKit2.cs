@@ -69,25 +69,18 @@ namespace ClaudeNotify
         void ShowList()
         {
             if (items.Count == 0 || !Enabled) return;
-            var m = new ContextMenuStrip();
-            m.ShowImageMargin = false;
-            m.Font = Font;
-            m.RightToLeft = RightToLeft;
-            m.BackColor = Color.White;
-            m.MinimumSize = new Size(Width, 0);
-            for (int i = 0; i < items.Count; i++)
-            {
-                int idx = i;
-                var it = new ToolStripMenuItem(items[i]);
-                it.Padding = Theme.P(8, 6, 8, 6);
-                if (i == sel) { it.Font = Theme.Semi(10f); it.ForeColor = Theme.AccentDark; }
-                it.Click += delegate { SelectedIndex = idx; };
-                m.Items.Add(it);
-            }
+            bool rtl = RightToLeft == RightToLeft.Yes;
+            var pop = new DropPopup(items, sel, Font, rtl, Width, delegate(int idx) { SelectedIndex = idx; });
+            Point below = PointToScreen(new Point(0, Height + 2));
+            Rectangle wa = Screen.FromControl(this).WorkingArea;
+            int x = rtl ? PointToScreen(new Point(Width, 0)).X - pop.Width : below.X;
+            int y = below.Y + pop.Height > wa.Bottom ? PointToScreen(Point.Empty).Y - pop.Height - 2 : below.Y;
+            x = Math.Max(wa.Left, Math.Min(x, wa.Right - pop.Width));
+            pop.Location = new Point(x, y);
             open = true;
             Invalidate();
-            m.Closed += delegate { open = false; Invalidate(); };
-            m.Show(this, new Point(0, Height + 2));
+            pop.FormClosed += delegate { open = false; Invalidate(); };
+            pop.Show(FindForm());
         }
 
         protected override void OnClick(EventArgs e) { base.OnClick(e); Focus(); ShowList(); }
@@ -260,42 +253,292 @@ namespace ClaudeNotify
         }
     }
 
-    // שעה (שעות:דקות:שניות) משלושה שדות מספר
+    // קטע אחד של שעון: חץ למעלה, מספר גדול (אפשר גם להקליד), חץ למטה. נעטף מ-59 ל-0 כמו שעון מעורר
+    class Segment : Control
+    {
+        readonly TextBox box = new TextBox();
+        readonly System.Windows.Forms.Timer repeat = new System.Windows.Forms.Timer();
+        int val, dir, hot;   // hot: -1 = חץ למעלה, 1 = חץ למטה
+        public int Max = 59;
+        public event EventHandler ValueChanged;
+
+        public Segment()
+        {
+            SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
+            Size = new Size(Theme.S(66), Theme.S(92));
+            box.BorderStyle = BorderStyle.None;
+            box.TextAlign = HorizontalAlignment.Center;
+            box.Font = Theme.Semi(17f);
+            box.ForeColor = Theme.Text;
+            box.BackColor = Color.White;
+            box.MaxLength = 2;
+            box.Text = "00";
+            Controls.Add(box);
+            box.Leave += delegate { Commit(); };
+            box.Enter += delegate { box.SelectAll(); };
+            box.MouseUp += delegate { if (box.SelectionLength == 0) box.SelectAll(); };
+            box.KeyPress += delegate(object s, KeyPressEventArgs e) { if (!char.IsControl(e.KeyChar) && !char.IsDigit(e.KeyChar)) e.Handled = true; };
+            box.KeyDown += delegate(object s, KeyEventArgs e)
+            {
+                if (e.KeyCode == Keys.Enter) { Commit(); e.SuppressKeyPress = true; }
+                else if (e.KeyCode == Keys.Up) { Step(1); box.SelectAll(); e.SuppressKeyPress = true; }
+                else if (e.KeyCode == Keys.Down) { Step(-1); box.SelectAll(); e.SuppressKeyPress = true; }
+            };
+            box.MouseWheel += delegate(object s, MouseEventArgs e) { Step(e.Delta > 0 ? 1 : -1); };
+            repeat.Tick += delegate { repeat.Interval = 90; Step(dir); };
+        }
+
+        public int Value
+        {
+            get { Commit(); return val; }
+            set { SetVal(value); }
+        }
+
+        void SetVal(int v)
+        {
+            int range = Max + 1;
+            v = ((v % range) + range) % range;
+            box.Text = v.ToString("00");
+            if (v == val) return;
+            val = v;
+            if (ValueChanged != null) ValueChanged(this, EventArgs.Empty);
+        }
+
+        void Commit()
+        {
+            int v;
+            if (int.TryParse(box.Text.Trim(), out v)) SetVal(Math.Min(v, Max)); else SetVal(val);
+        }
+
+        void Step(int d) { Commit(); SetVal(val + d); }
+
+        int BtnH { get { return Theme.S(26); } }
+
+        protected override void OnLayout(LayoutEventArgs e)
+        {
+            base.OnLayout(e);
+            int h = box.PreferredHeight;
+            box.SetBounds(Theme.S(6), BtnH + Theme.S(4) + (Height - BtnH * 2 - Theme.S(8) - h) / 2, Width - Theme.S(12), h);
+        }
+
+        int Zone(int y) { return y < BtnH ? -1 : y > Height - BtnH ? 1 : 0; }
+
+        protected override void OnMouseDown(MouseEventArgs e)
+        {
+            base.OnMouseDown(e);
+            if (!Enabled) return;
+            dir = -Zone(e.Y);   // חץ למעלה מגדיל
+            if (dir == 0) return;
+            Step(dir);
+            repeat.Interval = 400;
+            repeat.Start();
+        }
+        protected override void OnMouseUp(MouseEventArgs e) { base.OnMouseUp(e); repeat.Stop(); }
+        protected override void OnMouseMove(MouseEventArgs e) { base.OnMouseMove(e); int z = Zone(e.Y); if (z != hot) { hot = z; Cursor = z != 0 ? Cursors.Hand : Cursors.Default; Invalidate(); } }
+        protected override void OnMouseLeave(EventArgs e) { base.OnMouseLeave(e); hot = 0; repeat.Stop(); Invalidate(); }
+        protected override void Dispose(bool disposing) { if (disposing) repeat.Dispose(); base.Dispose(disposing); }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            var g = e.Graphics;
+            g.Clear(Parent != null ? Parent.BackColor : Theme.Card);
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            var mid = new RectangleF(0.75f, BtnH + Theme.S(2), Width - 2f, Height - BtnH * 2 - Theme.S(4));
+            using (var path = Theme.RoundRect(mid, Theme.S(8)))
+            using (var b = new SolidBrush(Color.White))
+            using (var pen = new Pen(Color.FromArgb(205, 197, 180), 1.3f))
+            {
+                g.FillPath(b, path);
+                g.DrawPath(pen, path);
+            }
+            for (int side = -1; side <= 1; side += 2)
+            {
+                var br = new RectangleF(Theme.S(2), side < 0 ? 0 : Height - BtnH, Width - Theme.S(4), BtnH);
+                using (var path = Theme.RoundRect(br, Theme.S(7)))
+                using (var b = new SolidBrush(hot == side ? Color.FromArgb(249, 224, 212) : Theme.AccentSoft))
+                    g.FillPath(b, path);
+                float cx = br.X + br.Width / 2f, cy = br.Y + br.Height / 2f, aw = Theme.S(6), ah = Theme.S(3);
+                float k = side < 0 ? 1 : -1;   // למעלה: ^  למטה: v
+                using (var pen = new Pen(Theme.AccentDark, 2.4f) { StartCap = LineCap.Round, EndCap = LineCap.Round, LineJoin = LineJoin.Round })
+                    g.DrawLines(pen, new[] { new PointF(cx - aw, cy + k * ah), new PointF(cx, cy - k * ah), new PointF(cx + aw, cy + k * ah) });
+            }
+        }
+    }
+
+    // שעה (שעות : דקות : שניות) כשלושה קטעי שעון עם חצים בולטים
     class TimeBox : Panel
     {
-        readonly Stepper h = new Stepper(), m = new Stepper(), s = new Stepper();
+        readonly Segment h = new Segment(), m = new Segment(), s = new Segment();
         readonly Label c1 = new Label(), c2 = new Label();
 
         public TimeBox()
         {
             BackColor = Theme.Card;
-            Height = Theme.S(34);
-            h.Maximum = 23; m.Maximum = 59; s.Maximum = 59;
-            h.Format = m.Format = s.Format = "00";
+            h.Max = 23;
+            Height = h.Height;
             foreach (var c in new[] { c1, c2 })
             {
-                c.Text = ":"; c.AutoSize = false; c.TextAlign = ContentAlignment.MiddleCenter; c.Font = Theme.Semi(12f); c.ForeColor = Theme.Muted; c.BackColor = Theme.Card;
+                c.Text = ":"; c.AutoSize = false; c.TextAlign = ContentAlignment.MiddleCenter; c.Font = Theme.Semi(16f); c.ForeColor = Theme.Muted; c.BackColor = Theme.Card;
             }
             Controls.AddRange(new Control[] { h, c1, m, c2, s });
         }
 
         public TimeSpan Time
         {
-            get { return new TimeSpan((int)h.Value, (int)m.Value, (int)s.Value); }
+            get { return new TimeSpan(h.Value, m.Value, s.Value); }
             set { h.Value = value.Hours; m.Value = value.Minutes; s.Value = value.Seconds; }
         }
 
         protected override void OnLayout(LayoutEventArgs e)
         {
             base.OnLayout(e);
-            int colon = Theme.S(10);
-            int w = Math.Max(Theme.S(60), (Width - colon * 2) / 3);
-            // תמיד שעות משמאל לדקות ולשניות, כמו שעון דיגיטלי
-            h.SetBounds(0, 0, w, Height);
-            c1.SetBounds(w, 0, colon, Height);
-            m.SetBounds(w + colon, 0, w, Height);
-            c2.SetBounds(w * 2 + colon, 0, colon, Height);
-            s.SetBounds(w * 2 + colon * 2, 0, w, Height);
+            int colon = Theme.S(14), w = h.Width;
+            // תמיד שעות מצד שמאל ושניות מצד ימין, כמו שעון דיגיטלי
+            int total = w * 3 + colon * 2;
+            int x0 = Math.Max(0, (Width - total) / 2);
+            h.Location = new Point(x0, 0);
+            c1.SetBounds(x0 + w, 0, colon, Height);
+            m.Location = new Point(x0 + w + colon, 0);
+            c2.SetBounds(x0 + w * 2 + colon, 0, colon, Height);
+            s.Location = new Point(x0 + w * 2 + colon * 2, 0);
+        }
+    }
+
+    // רשימת הבחירה הנפתחת: חלון קטן בעיצוב התוכנה, שמוצמד לפקד ונסגר בלחיצה בחוץ
+    class DropPopup : Form
+    {
+        readonly ListBox list = new ListBox();
+        readonly int selected;
+        readonly bool rtl;
+        int hover = -1;
+
+        public DropPopup(List<string> items, int sel, Font font, bool rtl, int minWidth, Action<int> onPick)
+        {
+            this.rtl = rtl; selected = sel;
+            FormBorderStyle = FormBorderStyle.None;
+            ShowInTaskbar = false;
+            StartPosition = FormStartPosition.Manual;
+            TopMost = true;
+            BackColor = Theme.Accent;
+            Padding = new Padding(1);
+            Font = font;
+
+            int itemH = Theme.S(36), w = minWidth;
+            foreach (var t in items) w = Math.Max(w, TextRenderer.MeasureText(t, font).Width + Theme.S(44));
+            list.Dock = DockStyle.Fill;
+            list.BorderStyle = BorderStyle.None;
+            list.BackColor = Color.White;
+            list.DrawMode = DrawMode.OwnerDrawFixed;
+            list.ItemHeight = itemH;
+            list.IntegralHeight = false;
+            foreach (var t in items) list.Items.Add(t);
+            Controls.Add(list);
+            Size = new Size(w + 2, Math.Min(items.Count, 8) * itemH + 2);
+
+            list.DrawItem += OnDrawItem;
+            list.MouseMove += delegate(object s, MouseEventArgs e)
+            {
+                int i = list.IndexFromPoint(e.Location);
+                if (i != hover) { hover = i; list.Invalidate(); }
+            };
+            list.MouseLeave += delegate { hover = -1; list.Invalidate(); };
+            list.MouseClick += delegate(object s, MouseEventArgs e)
+            {
+                int i = list.IndexFromPoint(e.Location);
+                if (i >= 0) { Close(); onPick(i); }
+            };
+            list.KeyDown += delegate(object s, KeyEventArgs e)
+            {
+                if (e.KeyCode == Keys.Escape) Close();
+                else if (e.KeyCode == Keys.Enter && list.SelectedIndex >= 0) { int i = list.SelectedIndex; Close(); onPick(i); }
+            };
+            Deactivate += delegate { if (!IsDisposed) Close(); };
+            Shown += delegate { if (selected >= 0) list.SelectedIndex = selected; list.Focus(); };
+        }
+
+        void OnDrawItem(object sender, DrawItemEventArgs e)
+        {
+            if (e.Index < 0) return;
+            var g = e.Graphics;
+            bool isSel = e.Index == selected;
+            bool isHot = e.Index == hover || (hover < 0 && (e.State & DrawItemState.Selected) != 0 && !isSel);
+            using (var b = new SolidBrush(isHot ? Theme.AccentSoft : Color.White))
+                g.FillRectangle(b, e.Bounds);
+            var r = new Rectangle(e.Bounds.X + Theme.S(12), e.Bounds.Y, e.Bounds.Width - Theme.S(24), e.Bounds.Height);
+            using (var f = isSel ? Theme.Semi(Font.Size) : Font)
+                TextRenderer.DrawText(g, list.Items[e.Index].ToString(), f, r, isSel ? Theme.AccentDark : Theme.Text,
+                    TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPadding | (rtl ? TextFormatFlags.Right | TextFormatFlags.RightToLeft : TextFormatFlags.Left));
+        }
+
+        protected override CreateParams CreateParams
+        {
+            get { var cp = base.CreateParams; cp.ClassStyle |= 0x00020000; return cp; }   // CS_DROPSHADOW
+        }
+    }
+
+    // תפריט קליק ימני בעיצוב התוכנה
+    class MenuColors : ProfessionalColorTable
+    {
+        public override Color MenuItemSelected { get { return Theme.AccentSoft; } }
+        public override Color MenuItemSelectedGradientBegin { get { return Theme.AccentSoft; } }
+        public override Color MenuItemSelectedGradientEnd { get { return Theme.AccentSoft; } }
+        public override Color MenuItemBorder { get { return Theme.AccentSoft; } }
+        public override Color MenuBorder { get { return Theme.Border; } }
+        public override Color ToolStripDropDownBackground { get { return Color.White; } }
+        public override Color ImageMarginGradientBegin { get { return Color.White; } }
+        public override Color ImageMarginGradientMiddle { get { return Color.White; } }
+        public override Color ImageMarginGradientEnd { get { return Color.White; } }
+        public override Color SeparatorDark { get { return Theme.Border; } }
+        public override Color SeparatorLight { get { return Color.White; } }
+        public override Color CheckBackground { get { return Theme.AccentSoft; } }
+        public override Color CheckSelectedBackground { get { return Theme.AccentSoft; } }
+        public override Color CheckPressedBackground { get { return Theme.AccentSoft; } }
+    }
+
+    static class MenuStyle
+    {
+        public static void Apply(ContextMenuStrip m)
+        {
+            m.Renderer = new ToolStripProfessionalRenderer(new MenuColors());
+            m.BackColor = Color.White;
+            m.ForeColor = Theme.Text;
+            m.Font = Theme.F(10.5f);
+            m.Padding = Theme.P(4, 6, 4, 6);
+            foreach (ToolStripItem it in m.Items)
+                if (it is ToolStripMenuItem) it.Padding = Theme.P(6, 7, 14, 7);
+        }
+    }
+
+    // חלון הודעה בעיצוב התוכנה (במקום MessageBox של Windows)
+    static class Dialog
+    {
+        public static void Show(Form owner, string title, string body)
+        {
+            bool rtl = L.He;
+            using (var f = new Form())
+            {
+                f.Text = title;
+                f.FormBorderStyle = FormBorderStyle.FixedDialog;
+                f.MaximizeBox = false; f.MinimizeBox = false; f.ShowInTaskbar = false;
+                f.StartPosition = owner != null ? FormStartPosition.CenterParent : FormStartPosition.CenterScreen;
+                f.BackColor = Theme.Bg;
+                f.Font = Theme.F(10f);
+                f.Icon = Branding.AppIcon;
+
+                int pad = Theme.S(24), w = Theme.S(500);
+                var lbl = new Label { AutoSize = false, Text = body, Font = Theme.F(10f), ForeColor = Theme.Text, BackColor = Theme.Bg, RightToLeft = rtl ? RightToLeft.Yes : RightToLeft.No, TextAlign = ContentAlignment.TopLeft };
+                int bodyH = Theme.TextHeight(body, lbl.Font, w - pad * 2, rtl) + Theme.S(4);
+                lbl.SetBounds(pad, pad, w - pad * 2, bodyH);
+                var ok = new PillButton(L.T("אישור", "OK"), true);
+                ok.Top = pad + bodyH + Theme.S(18);
+                ok.Left = rtl ? w - pad - ok.Width : pad;
+                ok.Click += delegate { f.Close(); };
+                f.ClientSize = new Size(w, ok.Bottom + pad);
+                f.Controls.Add(lbl); f.Controls.Add(ok);
+                f.AcceptButton = ok; f.CancelButton = ok;
+                f.Paint += delegate(object s, PaintEventArgs e) { using (var b = new SolidBrush(Theme.Accent)) e.Graphics.FillRectangle(b, 0, 0, f.ClientSize.Width, Theme.S(4)); };
+                if (owner != null) f.ShowDialog(owner); else f.ShowDialog();
+            }
         }
     }
 }
