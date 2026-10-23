@@ -7,6 +7,7 @@ using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
 using System.Web.Script.Serialization;
+using System.Windows.Automation;
 using System.Windows.Forms;
 
 // הודעה מתוזמנת לפתיחת מכסת 5 השעות של Claude.
@@ -18,7 +19,8 @@ namespace ClaudeNotify
     // ---------------------------------------------------------------- Config (schedule.json)
     class SchedConfig
     {
-        public string Method { get; set; }          // "browser" = דרך הדפדפן, "cli" = דרך Claude Code בלי דפדפן
+        public string Method { get; set; }          // "browser" = דרך הדפדפן, "cli" = דרך Claude Code בלי דפדפן, "vscode" = לחלון VS Code שנבחר
+        public string WindowTitle { get; set; }     // כותרת חלון ה-VS Code שנבחר (לשיטת "vscode")
         public string ProfileKey { get; set; }      // "Chrome|Profile 1"
         public string Url { get; set; }
         public string Text { get; set; }
@@ -30,12 +32,14 @@ namespace ClaudeNotify
         public int TabCount { get; set; }
         public bool SendEnter { get; set; }
         public bool KeepAwake { get; set; }
+        public bool Wake { get; set; }              // להעיר את המחשב משינה בשעת השליחה (דרך מתזמן המשימות של Windows)
         public bool AllowScreenOff { get; set; }
         public int MinBattery { get; set; }
 
         public SchedConfig()
         {
             Method = "browser";
+            WindowTitle = "";
             ProfileKey = "";
             Url = "https://claude.ai/new";
             Text = "היי";
@@ -47,6 +51,7 @@ namespace ClaudeNotify
             TabCount = 0;
             SendEnter = true;
             KeepAwake = true;
+            Wake = true;
             AllowScreenOff = false;
             MinBattery = 20;
         }
@@ -79,7 +84,8 @@ namespace ClaudeNotify
 
         void Fix()
         {
-            if (Method != "cli" && Method != "browser") Method = "browser";
+            if (Method != "cli" && Method != "browser" && Method != "vscode") Method = "browser";
+            if (WindowTitle == null) WindowTitle = "";
             if (ProfileKey == null) ProfileKey = "";
             if (string.IsNullOrEmpty(Url)) Url = "https://claude.ai/new";
             if (Text == null) Text = "";
@@ -284,12 +290,61 @@ namespace ClaudeNotify
         }
     }
 
+    // ---------------------------------------------------------------- Windows Task Scheduler
+    // רושם משימה חד-פעמית שמעירה את המחשב משינה בשעת השליחה, ומפעילה את התוכנה (--run-schedule) אם היא כבר לא רצה
+    // (למשל אחרי הפעלה מחדש). אם התוכנה כן רצה - היא שולחת בעצמה והמשימה רק מעירה את המחשב.
+    // אין StartWhenAvailable: אם המחשב היה כבוי בשעה הזו - לא שולחים באיחור.
+    static class TaskSched
+    {
+        const string Folder = "\\ClaudeNotify\\";
+
+        static void RunPs(string script, bool wait)
+        {
+            try
+            {
+                string enc = Convert.ToBase64String(Encoding.Unicode.GetBytes("$ErrorActionPreference='Stop'\r\n" + script));
+                var psi = new ProcessStartInfo("powershell", "-NoProfile -NonInteractive -EncodedCommand " + enc);
+                psi.UseShellExecute = false;
+                psi.CreateNoWindow = true;
+                psi.RedirectStandardError = true;
+                psi.RedirectStandardOutput = true;
+                using (var p = Process.Start(psi))
+                {
+                    var err = p.StandardError.ReadToEndAsync();
+                    p.StandardOutput.ReadToEndAsync();
+                    if (!wait) return;
+                    if (!p.WaitForExit(20000)) { try { p.Kill(); } catch { } Log.Write("task scheduler: timeout"); return; }
+                    if (p.ExitCode != 0) Log.Write("task scheduler: " + err.Result.Trim());
+                }
+            }
+            catch (Exception ex) { Log.Write("task scheduler error: " + ex.Message); }
+        }
+
+        static string Q(string s) { return "'" + s.Replace("'", "''") + "'"; }
+
+        public static void Register(DateTime at, bool wake)
+        {
+            string exe = Application.ExecutablePath;
+            RunPs(
+                "$a = New-ScheduledTaskAction -Execute " + Q(exe) + " -Argument '--run-schedule'\r\n" +
+                "$t = New-ScheduledTaskTrigger -Once -At ([datetime]" + Q(at.ToString("yyyy-MM-dd'T'HH:mm:ss", System.Globalization.CultureInfo.InvariantCulture)) + ")\r\n" +
+                "$st = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Minutes 10) -MultipleInstances IgnoreNew" + (wake ? " -WakeToRun" : "") + "\r\n" +
+                "$p = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive\r\n" +
+                "Register-ScheduledTask -TaskPath " + Q(Folder) + " -TaskName 'send' -Trigger $t -Action $a -Settings $st -Principal $p -Force | Out-Null", true);
+        }
+
+        public static void Remove()
+        {
+            RunPs("Unregister-ScheduledTask -TaskPath " + Q(Folder) + " -TaskName 'send' -Confirm:$false -ErrorAction SilentlyContinue", false);
+        }
+    }
+
     // ---------------------------------------------------------------- Schedule runner
     // רץ כולו על ה-thread של הממשק (טיימר אחד), כמו ב-tkinter של הסקריפט המקורי.
     // הוא שייך ל-TrayContext ולא לחלון, ולכן סגירת החלון לא מבטלת את התזמון.
     class ScheduleRunner
     {
-        enum Phase { Idle, WaitStart, WaitPage, Typing, Done, Sending }
+        enum Phase { Idle, WaitStart, WaitPage, Typing, Done, Sending, VsInput, VsEnter, VsVerify }
         class FocusLost : Exception { }
 
         // בודק דרך UI Automation של Windows אם הפוקוס נמצא בתוך דף אינטרנט (רכיב Document) ולא בשורת הכתובת.
@@ -326,6 +381,14 @@ try {
         string prefix = "";
         int checkFailures, runId;
         IntPtr browserHwnd;
+        long vsHandle;
+        bool taskRegistered;
+        DateTime vsStart;
+        int vsTries, vsPasteTries;
+        AutomationElement vsInput;
+        DateTime vsEnterAt;
+        DateTime vsDeadline, vsNewInputUntil;
+        HashSet<string> vsOldInputs = new HashSet<string>();
         string oldClip;
         bool wantAwake, awakeOn, allowScreenOff;
 
@@ -347,11 +410,15 @@ try {
         }
 
         // מחזיר null אם התחיל, או הסבר על מה שחסר
-        public string Start(SchedConfig cfg)
+        public string Start(SchedConfig cfg) { return Start(cfg, false); }
+
+        // immediate = הופעל ע"י משימת Windows בדיוק בשעת השליחה: לא מחכים ולא רושמים משימה חדשה
+        public string Start(SchedConfig cfg, bool immediate)
         {
             if (Running) return "כבר יש תזמון פעיל";
             profile = null;
             if (string.IsNullOrWhiteSpace(cfg.Text)) return "צריך להקליד טקסט לשליחה";
+            if (cfg.Method == "vscode" && string.IsNullOrEmpty(cfg.WindowTitle)) return "צריך לבחור חלון VS Code (אם הרשימה ריקה - פתח את החלון ולחץ על הכפתור 'רענן')";
             if (cfg.Method == "browser")
             {
                 foreach (var p in BrowserProfiles.List()) if (p.Key == cfg.ProfileKey) profile = p;
@@ -364,7 +431,8 @@ try {
 
             DateTime target;
             string when;
-            if (cfg.UseTime)
+            if (immediate) { target = DateTime.Now; when = "עכשיו."; }
+            else if (cfg.UseTime)
             {
                 TimeSpan t;
                 if (!TimeSpan.TryParse(cfg.AtTime, out t)) return "השעה לא תקינה";
@@ -382,13 +450,19 @@ try {
             Cancelled = false;
             Target = target;
             deadline = target;
-            prefix = (cfg.Method == "cli" ? "ההודעה תישלח " : "הדפדפן ייפתח ") + when;
+            prefix = (cfg.Method == "browser" ? "הדפדפן ייפתח " : "ההודעה תישלח ") + when;
             wantAwake = cfg.KeepAwake;
             allowScreenOff = cfg.AllowScreenOff && !modernStandby;
             awakeOn = false;
             oldClip = null;
             runId++;
             phase = Phase.WaitStart;
+            taskRegistered = false;
+            if (!immediate && (target - DateTime.Now).TotalSeconds >= 90)
+            {
+                TaskSched.Register(target, cfg.Wake);
+                taskRegistered = true;
+            }
             UpdateAwake();
             if (Started != null) Started();
             OnTick(null, EventArgs.Empty);
@@ -421,6 +495,9 @@ try {
                     case Phase.WaitStart: Countdown(OnStart); break;
                     case Phase.WaitPage: Countdown(TryType); break;
                     case Phase.Typing: TryType(); break;
+                    case Phase.VsInput: VsFillInput(); break;
+                    case Phase.VsEnter: VsPressEnter(); break;
+                    case Phase.VsVerify: VsVerify(); break;
                     case Phase.Done: RestoreClipboard(); Finish("בוצע!", false); break;
                 }
             }
@@ -451,6 +528,7 @@ try {
         void OnStart()
         {
             if (c.Method == "cli") { SendViaClaudeCode(); return; }
+            if (c.Method == "vscode") { SendToVsCodeWindow(); return; }
 
             Power.WakeDisplay();
             if (Power.IsLocked()) { Finish("המחשב היה נעול בשעת ההפעלה, ולכן לא נעשה כלום", true); return; }
@@ -468,6 +546,229 @@ try {
             deadline = DateTime.Now.AddSeconds(c.MinWaitSeconds);
             prefix = "ממתין לטעינת הדף:";
             Countdown(TryType);
+        }
+
+        // ---- שליחה לחלון VS Code מסוים ----
+        // מעלים את החלון שנבחר לחזית, ופותחים בו שיחה חדשה עם הטקסט דרך הכתובת vscode://anthropic.claude-code/open?prompt=...
+        // (התוסף של Claude Code תומך בה). אחרי כמה שניות לוחצים Enter כדי לשלוח, למקרה שהטקסט רק הוכנס לתיבה
+        void SendToVsCodeWindow()
+        {
+            Power.WakeDisplay();
+            if (Power.IsLocked()) { Finish("המחשב היה נעול בשעת ההפעלה, ולכן לא נעשה כלום", true); return; }
+
+            var found = FindVsWindow(c.WindowTitle);
+            if (found == null) { Finish("חלון ה-VS Code שנבחר (\"" + c.WindowTitle + "\") כבר לא פתוח, ולכן לא נשלח כלום", true); return; }
+            string scheme = WinApi.SchemeFor(found.Handle);
+            if (scheme == null) { Finish("לא הצלחתי לזהות איזה עורך זה (Code או Cursor)", true); return; }
+
+            if (Launching != null) Launching();   // החלון שלנו נעלם כדי שלא יגנוב פוקוס
+            if (!WinApi.Focus(found.Handle)) { Finish("לא הצלחתי להעלות את חלון ה-VS Code לחזית (Windows חסם), ולכן לא נשלח כלום", true); return; }
+            Thread.Sleep(500); // ל-VS Code לוקח רגע לרשום שזה החלון הפעיל, ושם ה-URI מנותב
+            if (Native.GetForegroundWindow().ToInt64() != found.Handle) { Finish("החלון שנבחר איבד פוקוס לפני השליחה, ולכן לא נשלח כלום", true); return; }
+
+            vsHandle = found.Handle;
+            vsStart = DateTime.Now.AddSeconds(-2);
+            vsTries = 0;
+            vsPasteTries = 0;
+            vsOldInputs = CurrentInputs(found.Handle);
+            vsNewInputUntil = DateTime.Now.AddSeconds(8);   // 8 שניות ראשונות: מחכים לתיבה של השיחה החדשה ולא נוגעים בתיבות שהיו קודם
+            vsDeadline = DateTime.Now.AddSeconds(30);
+            oldClip = ReadClipboard();
+            var psi = new ProcessStartInfo(scheme + "://anthropic.claude-code/open");
+            psi.UseShellExecute = true;
+            Process.Start(psi);
+            Log.Write("schedule: opened prompt in window [" + found.Title + "]");
+
+            phase = Phase.VsInput;
+            SetStatus("ממתין שהשיחה תיפתח בחלון...", false);
+            Next(2500);
+        }
+
+        // ---- מילוי תיבת ההקלדה של Claude בחלון שנבחר ----
+        // כתובת ה-URI עם prompt לא ממלאת את התיבה בפועל, ולכן מוצאים את התיבה ("Message input") דרך UI Automation,
+        // מדביקים אליה את הטקסט, ובודקים שהוא באמת נכנס לפני שלוחצים Enter
+        void VsFillInput()
+        {
+            if (Native.GetForegroundWindow().ToInt64() != vsHandle) WinApi.Focus(vsHandle);
+            AutomationElement input = null;
+            bool allowOld = DateTime.Now > vsNewInputUntil;
+            try { input = FindMessageInput(vsHandle, allowOld ? null : vsOldInputs); }
+            catch (Exception ex) { Log.Write("uia error: " + ex.Message); }
+            if (input == null)
+            {
+                if (DateTime.Now > vsDeadline) { Finish("לא מצאתי תיבת הקלדה של Claude בחלון שנבחר, ולכן לא נשלח כלום", true); return; }
+                Next(1000);
+                return;
+            }
+            browserHwnd = new IntPtr(vsHandle);
+            try
+            {
+                try { input.SetFocus(); } catch { }
+                Thread.Sleep(250);
+                bool focused = false;
+                try { focused = input.Current.HasKeyboardFocus; } catch { }
+                if (focused)
+                {
+                    SetClipboard(c.Text);
+                    Key(VK_A, true, false);   // רק אחרי שווידאנו שהפוקוס בתיבה עצמה, כדי לא לדרוס קובץ בעורך
+                    Key(VK_V, true, false);
+                    Thread.Sleep(500);
+                }
+            }
+            catch (FocusLost) { Finish("חלון אחר קפץ לחזית לפני ההקלדה, ולכן לא נשלח כלום", true); return; }
+
+            string val = InputValue(input);
+            if (val != null && Norm(val) == Norm(c.Text))
+            {
+                vsInput = input;
+                Log.Write("schedule: text is in the input, pressing Enter");
+                phase = Phase.VsEnter;
+                Next(200);
+                return;
+            }
+            vsPasteTries++;
+            Log.Write("schedule: paste attempt " + vsPasteTries + " value=[" + val + "]");
+            if (vsPasteTries >= 4) { Finish("מצאתי את תיבת ההקלדה אבל לא הצלחתי להכניס אליה את הטקסט, ולכן לא נשלח כלום", true); return; }
+            Next(1000);
+        }
+
+        // מחזיר את תיבת ההקלדה הנראית בחלון (עדיפות לזו שיש בה פוקוס). exclude = תיבות שהיו כבר לפני שפתחנו שיחה חדשה
+        static AutomationElement FindMessageInput(long hwnd, HashSet<string> exclude)
+        {
+            var root = AutomationElement.FromHandle(new IntPtr(hwnd));
+            var cond = new AndCondition(
+                new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Edit),
+                new PropertyCondition(AutomationElement.NameProperty, "Message input"));
+            AutomationElement best = null;
+            foreach (AutomationElement e in root.FindAll(TreeScope.Descendants, cond))
+            {
+                if (e.Current.IsOffscreen) continue;
+                if (exclude != null && exclude.Contains(RuntimeKey(e))) continue;
+                if (e.Current.HasKeyboardFocus) return e;
+                if (best == null) best = e;
+            }
+            return best;
+        }
+
+        static HashSet<string> CurrentInputs(long hwnd)
+        {
+            var set = new HashSet<string>();
+            try
+            {
+                var root = AutomationElement.FromHandle(new IntPtr(hwnd));
+                var cond = new AndCondition(
+                    new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Edit),
+                    new PropertyCondition(AutomationElement.NameProperty, "Message input"));
+                foreach (AutomationElement e in root.FindAll(TreeScope.Descendants, cond)) set.Add(RuntimeKey(e));
+            }
+            catch (Exception ex) { Log.Write("uia error: " + ex.Message); }
+            return set;
+        }
+
+        static string RuntimeKey(AutomationElement e)
+        {
+            int[] id = e.GetRuntimeId();
+            return id == null ? "" : string.Join(",", Array.ConvertAll(id, x => x.ToString()));
+        }
+
+        static string InputValue(AutomationElement e)
+        {
+            try { return ((ValuePattern)e.GetCurrentPattern(ValuePattern.Pattern)).Current.Value; }
+            catch { return null; }
+        }
+
+        void VsPressEnter()
+        {
+            if (Power.IsLocked()) { Finish("המחשב ננעל לפני השליחה. הטקסט הוכנס לחלון אבל לא נשלח", true); return; }
+            browserHwnd = new IntPtr(vsHandle);
+            if (Native.GetForegroundWindow() != browserHwnd) WinApi.Focus(vsHandle);
+            try { Key(VK_RETURN, false, false); }
+            catch (FocusLost) { Finish("חלון אחר קפץ לחזית לפני השליחה. הטקסט הוכנס לחלון אבל לא נשלח", true); return; }
+            vsTries++;
+            if (vsTries == 1) vsEnterAt = DateTime.Now;
+            phase = Phase.VsVerify;
+            SetStatus("בודק שההודעה נשלחה...", false);
+            Next(1500);
+        }
+
+        // בודקים שההודעה נשלחה, בלי ללחוץ Enter שוב בטעות (Enter שני קוטע את התשובה של Claude):
+        // 1. נמצאה בתמלול = נשלחה.
+        // 2. הטקסט עדיין יושב בתיבה = ה-Enter לא נקלט, ולוחצים שוב (עד 3 פעמים).
+        // 3. התיבה התרוקנה אבל התמלול עוד לא התעדכן = נשלחה, ממשיכים לחכות לתמלול (עד 25 שניות מה-Enter הראשון)
+        void VsVerify()
+        {
+            if (PromptInTranscripts(c.Text, vsStart)) { phase = Phase.Done; Next(500); return; }
+
+            string val = vsInput != null ? InputValue(vsInput) : null;
+            bool stillInBox = val != null && Norm(val) == Norm(c.Text);
+            if (stillInBox)
+            {
+                if (vsTries >= 3) { Finish("לחצתי Enter, אבל ההודעה נשארה בתיבה ולא נשלחה. בדוק בחלון ה-VS Code", true); return; }
+                Log.Write("schedule: text still in the input after Enter " + vsTries + ", pressing again");
+                phase = Phase.VsEnter;
+                Next(200);
+                return;
+            }
+            if ((DateTime.Now - vsEnterAt).TotalSeconds > 25)
+            {
+                // התיבה התרוקנה, כלומר ההודעה יצאה, גם אם לא הצלחנו לאשר בתמלול
+                Log.Write("schedule: input cleared but no transcript match");
+                phase = Phase.Done;
+                Next(500);
+                return;
+            }
+            Next(1000);
+        }
+
+        static bool PromptInTranscripts(string text, DateTime since)
+        {
+            try
+            {
+                string root = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), @".claude\projects");
+                if (!Directory.Exists(root)) return false;
+                var ser = new JavaScriptSerializer { MaxJsonLength = int.MaxValue };
+                string want = Norm(text);
+                foreach (var f in Directory.GetFiles(root, "*.jsonl", SearchOption.AllDirectories))
+                {
+                    if (File.GetLastWriteTime(f) < since) continue;
+                    using (var fs = new FileStream(f, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+                    using (var sr = new StreamReader(fs, Encoding.UTF8))
+                    {
+                        string line;
+                        while ((line = sr.ReadLine()) != null)
+                        {
+                            if (line.IndexOf("\"user\"", StringComparison.Ordinal) < 0) continue;
+                            try
+                            {
+                                var o = ser.Deserialize<Dictionary<string, object>>(line);
+                                if (TextUtil.Str(o, "type") != "user") continue;
+                                var msg = o["message"] as Dictionary<string, object>;
+                                if (msg == null) continue;
+                                object content = msg["content"];
+                                string got = content as string;
+                                if (got == null && content is System.Collections.IEnumerable)
+                                    foreach (var part in (System.Collections.IEnumerable)content)
+                                    {
+                                        var pd = part as Dictionary<string, object>;
+                                        if (pd != null && TextUtil.Str(pd, "type") == "text") got += TextUtil.Str(pd, "text") + " ";
+                                    }
+                                if (got != null && Norm(got) == want) return true;
+                            }
+                            catch { }
+                        }
+                    }
+                }
+            }
+            catch (Exception ex) { Log.Write("verify error: " + ex.Message); }
+            return false;
+        }
+
+        // מחפש לפי הכותרת המנוקה מתווי כיווניות. אם יש כמה חלונות עם אותה כותרת - לוקח את העליון
+        public static WinInfo FindVsWindow(string title)
+        {
+            foreach (var w in WinApi.Find(Config.Load().ProcessList()))
+                if (WinApi.CleanTitle(w.Title) == title) return w;
+            return null;
         }
 
         // ---- שליחה דרך Claude Code (בלי דפדפן) ----
@@ -548,9 +849,21 @@ try {
         bool AttemptPaste()
         {
             string browserExe = Path.GetFileNameWithoutExtension(profile.Exe);
+            if (!Power.ForegroundProcessName().Equals(browserExe, StringComparison.OrdinalIgnoreCase))
+            {
+                // Windows לא תמיד מעלה את חלון הדפדפן לחזית כשהוא נפתח מתהליך ברקע. מחפשים בעצמנו את החלון
+                // של claude.ai (לפי הכותרת) ומעלים אותו. לא מצאנו - לא מקלידים בתוכנה אחרת
+                WinInfo pick = null;
+                foreach (var w in WinApi.Find(new[] { browserExe }))
+                {
+                    if (w.Title.IndexOf("claude", StringComparison.OrdinalIgnoreCase) < 0) continue;
+                    if (pick == null || (profile.Label.Length > 0 && w.Title.IndexOf(profile.Label, StringComparison.OrdinalIgnoreCase) >= 0)) pick = w;
+                }
+                if (pick == null || !WinApi.Focus(pick.Handle)) return false;
+            }
             browserHwnd = Native.GetForegroundWindow();
             if (!Power.ForegroundProcessName().Equals(browserExe, StringComparison.OrdinalIgnoreCase))
-                return false; // כדי לא להקליד בתוכנה אחרת שקפצה לחזית
+                return false;
             try
             {
                 if (c.TabCount > 0)
@@ -670,17 +983,18 @@ try {
             bool low = hasBattery && !plugged && pct < c.MinBattery;
             if (low && awakeOn) { Power.Release(); awakeOn = false; }
             else if (!low && !awakeOn) { Power.KeepAwake(allowScreenOff); awakeOn = true; }
-            PowerWarning = low ? "הסוללה ב-" + pct + "%, ולכן המחשב כבר לא נשמר ער (יחזור אם תחבר לחשמל)" : "";
+            PowerWarning = low ? L.Tr("הסוללה ב-" + pct + "%, ולכן המחשב כבר לא נשמר ער (יחזור אם תחבר לחשמל)") : "";
         }
 
         void SetStatus(string text, bool error)
         {
-            if (Status != null) Status(text, error);
+            if (Status != null) Status(L.Tr(text), error);
         }
 
         void Finish(string text, bool error)
         {
             timer.Stop();
+            RestoreClipboard();
             phase = Phase.Idle;
             runId++;
             Power.Release();
@@ -688,7 +1002,8 @@ try {
             wantAwake = false;
             PowerWarning = "";
             oldClip = null;
-            if (Finished != null) Finished(text, error);
+            if (taskRegistered) { taskRegistered = false; TaskSched.Remove(); }
+            if (Finished != null) Finished(L.Tr(text), error);
         }
 
         static string FmtLeft(double sec)
@@ -696,227 +1011,6 @@ try {
             int s = (int)Math.Max(0, Math.Round(sec));
             int h = s / 3600, m = (s % 3600) / 60, ss = s % 60;
             return h > 0 ? string.Format("{0}:{1:00}:{2:00}", h, m, ss) : string.Format("{0}:{1:00}", m, ss);
-        }
-    }
-
-    // ---------------------------------------------------------------- Schedule window
-    class ScheduleForm : Form
-    {
-        readonly ScheduleRunner runner;
-        List<BrowserProfile> profiles = new List<BrowserProfile>();
-        FlowLayoutPanel panel, rowProfile, rowUrl, rowDelay, rowTime, rowMinWait, rowMaxWait, rowTabs;
-        ComboBox cmbMethod, cmbProfile, cmbWhen;
-        TextBox txtUrl, txtText;
-        NumericUpDown numDelay, numMinWait, numMaxWait, numTabs, numBattery;
-        DateTimePicker dtpTime;
-        CheckBox chkSend, chkAwake, chkScreenOff;
-        Button btnStart, btnCancel;
-        Label lblHint, lblStatus, lblPower;
-
-        public ScheduleForm(ScheduleRunner runner)
-        {
-            this.runner = runner;
-            Text = "Claude Notify - הודעה מתוזמנת";
-            Font = new Font("Segoe UI", 10f);
-            RightToLeft = RightToLeft.Yes;
-            RightToLeftLayout = true;
-            FormBorderStyle = FormBorderStyle.FixedDialog;
-            MaximizeBox = false;
-            StartPosition = FormStartPosition.CenterScreen;
-            ClientSize = new Size(600, 660);
-            Icon = Branding.MakeIcon(32);
-
-            panel = new FlowLayoutPanel();
-            panel.Dock = DockStyle.Fill;
-            panel.FlowDirection = FlowDirection.TopDown;
-            panel.WrapContents = false;
-            panel.AutoScroll = true;
-            panel.Padding = new Padding(16);
-            panel.RightToLeft = RightToLeft.Yes;
-            Controls.Add(panel);
-
-            var intro = new Label { AutoSize = true, MaximumSize = new Size(540, 0), Margin = new Padding(3, 3, 3, 8), Font = new Font("Segoe UI", 10f, FontStyle.Bold),
-                Text = "שולח הודעה קצרה לקלוד בשעה שתבחר, כדי שמכסת 5 השעות תתחיל לרוץ מראש." };
-            panel.Controls.Add(intro);
-
-            cmbMethod = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 340, RightToLeft = RightToLeft.Yes };
-            cmbMethod.Items.Add("דרך הדפדפן (פרופיל מחובר ל-claude.ai)");
-            cmbMethod.Items.Add("דרך Claude Code, בלי דפדפן");
-            AddRow("שיטת שליחה:", cmbMethod);
-            lblHint = new Label { AutoSize = true, MaximumSize = new Size(540, 0), ForeColor = Color.DimGray, Margin = new Padding(3, 0, 3, 8) };
-            panel.Controls.Add(lblHint);
-
-            cmbProfile = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 400, RightToLeft = RightToLeft.No };
-            rowProfile = AddRow("פרופיל:", cmbProfile);
-            txtUrl = new TextBox { Width = 340, RightToLeft = RightToLeft.No };
-            rowUrl = AddRow("כתובת האתר:", txtUrl);
-            txtText = new TextBox { Width = 340, RightToLeft = RightToLeft.Yes };
-            AddRow("הטקסט לשליחה:", txtText);
-
-            cmbWhen = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 200, RightToLeft = RightToLeft.Yes };
-            cmbWhen.Items.Add("אחרי השהיה בשניות");
-            cmbWhen.Items.Add("בשעה מסוימת");
-            AddRow("מתי להפעיל:", cmbWhen);
-            numDelay = new NumericUpDown { Minimum = 0, Maximum = 86400, Width = 90 };
-            rowDelay = AddRow("שניות עד ההפעלה:", numDelay);
-            dtpTime = new DateTimePicker { Format = DateTimePickerFormat.Custom, CustomFormat = "HH:mm:ss", ShowUpDown = true, Width = 110, RightToLeft = RightToLeft.No };
-            rowTime = AddRow("שעה (אם כבר עברה - מחר):", dtpTime);
-
-            numMinWait = new NumericUpDown { Minimum = 0, Maximum = 60, Width = 70 };
-            rowMinWait = AddRow("שניות המתנה לפני הניסיון הראשון להקליד:", numMinWait);
-            numMaxWait = new NumericUpDown { Minimum = 10, Maximum = 600, Width = 70 };
-            rowMaxWait = AddRow("מקסימום שניות לחכות שהדף ייטען:", numMaxWait);
-            numTabs = new NumericUpDown { Minimum = 0, Maximum = 30, Width = 70 };
-            rowTabs = AddRow("מספר לחיצות Tab (0 = השדה שכבר מסומן):", numTabs);
-            chkSend = Check("ללחוץ גם Enter (לשלוח)");
-
-            chkAwake = Check("לשמור על המחשב ער עד אז");
-            chkScreenOff = Check(runner.ModernStandby
-                ? "לאפשר למסך לכבות - לא אפשרי במחשב הזה, כי כיבוי מסך מרדים אותו"
-                : "לאפשר למסך לכבות - הוא יודלק מחדש בשעת ההפעלה");
-            if (runner.ModernStandby) chkScreenOff.Enabled = false;
-            numBattery = new NumericUpDown { Minimum = 0, Maximum = 100, Width = 70 };
-            AddRow("על סוללה: להפסיק לשמור על המחשב ער מתחת לאחוז:", numBattery);
-
-            var btns = new FlowLayoutPanel { AutoSize = true, FlowDirection = FlowDirection.LeftToRight, WrapContents = false, RightToLeft = RightToLeft.Yes, Margin = new Padding(3, 12, 3, 3) };
-            btnStart = new Button { Text = "התחל", AutoSize = true, Padding = new Padding(14, 2, 14, 2) };
-            btnCancel = new Button { Text = "בטל", AutoSize = true, Padding = new Padding(14, 2, 14, 2) };
-            btnStart.Click += delegate { DoStart(); };
-            btnCancel.Click += delegate { runner.Cancel(); };
-            btns.Controls.Add(btnStart);
-            btns.Controls.Add(btnCancel);
-            panel.Controls.Add(btns);
-
-            lblStatus = new Label { AutoSize = true, MaximumSize = new Size(540, 0), Margin = new Padding(3, 6, 3, 3), Font = new Font("Segoe UI", 10.5f, FontStyle.Bold) };
-            panel.Controls.Add(lblStatus);
-            lblPower = new Label { AutoSize = true, MaximumSize = new Size(540, 0), ForeColor = Color.Firebrick };
-            panel.Controls.Add(lblPower);
-            panel.Controls.Add(new Label { AutoSize = true, MaximumSize = new Size(540, 0), ForeColor = Color.DimGray, Margin = new Padding(3, 8, 3, 3),
-                Text = "אפשר לסגור את החלון - התזמון ממשיך לרוץ ברקע מהאייקון. יציאה מהתוכנה מבטלת אותו, והמחשב צריך להישאר דלוק." });
-
-            cmbMethod.SelectedIndexChanged += delegate { ApplyVisibility(); };
-            cmbWhen.SelectedIndexChanged += delegate { ApplyVisibility(); };
-
-            runner.Status += delegate(string text, bool error) { SetStatus(text, error); lblPower.Text = runner.PowerWarning; };
-            runner.Finished += delegate(string text, bool error) { SetRunning(false); SetStatus(text, error); lblPower.Text = ""; };
-            runner.Launching += delegate { Hide(); };   // שהחלון הזה לא יגנוב את הפוקוס מהדפדפן
-
-            FormClosing += delegate(object s, FormClosingEventArgs e)
-            {
-                if (e.CloseReason == CloseReason.UserClosing) { e.Cancel = true; Hide(); }
-            };
-
-            LoadFromConfig(SchedConfig.Load());
-        }
-
-        FlowLayoutPanel AddRow(string label, Control ctl)
-        {
-            var r = new FlowLayoutPanel { AutoSize = true, FlowDirection = FlowDirection.LeftToRight, WrapContents = false, RightToLeft = RightToLeft.Yes };
-            r.Controls.Add(new Label { Text = label, AutoSize = true, Margin = new Padding(3, 6, 3, 3) });
-            r.Controls.Add(ctl);
-            panel.Controls.Add(r);
-            return r;
-        }
-
-        CheckBox Check(string text)
-        {
-            var c = new CheckBox { Text = text, AutoSize = true, Margin = new Padding(3, 4, 3, 4) };
-            panel.Controls.Add(c);
-            return c;
-        }
-
-        void ApplyVisibility()
-        {
-            bool browser = cmbMethod.SelectedIndex != 1;
-            rowProfile.Visible = rowUrl.Visible = rowMinWait.Visible = rowMaxWait.Visible = rowTabs.Visible = chkSend.Visible = browser;
-            rowDelay.Visible = cmbWhen.SelectedIndex != 1;
-            rowTime.Visible = cmbWhen.SelectedIndex == 1;
-            lblHint.Text = browser
-                ? "פותח את הדפדפן הרגיל עם הפרופיל שבחרת (חייב להיות מחובר ל-claude.ai), ומקליד שם. בשעת ההפעלה לא לגעת במקלדת ובעכבר."
-                : "שולח הודעה קצרה דרך Claude Code (מודל Haiku), בלי דפדפן ובלי הקלדה, ולכן גם לא תלוי במסך נעול. נספר על אותה מכסה של המנוי.";
-        }
-
-        void LoadProfiles(string selectedKey)
-        {
-            profiles = BrowserProfiles.List();
-            cmbProfile.Items.Clear();
-            int sel = 0;
-            for (int i = 0; i < profiles.Count; i++)
-            {
-                cmbProfile.Items.Add(profiles[i].ToString());
-                if (profiles[i].Key == selectedKey) sel = i;
-            }
-            if (profiles.Count > 0) cmbProfile.SelectedIndex = sel;
-        }
-
-        void LoadFromConfig(SchedConfig s)
-        {
-            cmbMethod.SelectedIndex = s.Method == "cli" ? 1 : 0;
-            LoadProfiles(s.ProfileKey);
-            txtUrl.Text = s.Url;
-            txtText.Text = s.Text;
-            cmbWhen.SelectedIndex = s.UseTime ? 1 : 0;
-            numDelay.Value = s.DelaySeconds;
-            TimeSpan t; TimeSpan.TryParse(s.AtTime, out t);
-            dtpTime.Value = DateTime.Today + t;
-            numMinWait.Value = s.MinWaitSeconds;
-            numMaxWait.Value = s.MaxWaitSeconds;
-            numTabs.Value = s.TabCount;
-            chkSend.Checked = s.SendEnter;
-            chkAwake.Checked = s.KeepAwake;
-            chkScreenOff.Checked = s.AllowScreenOff && !runner.ModernStandby;
-            numBattery.Value = s.MinBattery;
-            ApplyVisibility();
-            SetRunning(runner.Running);
-        }
-
-        SchedConfig Collect()
-        {
-            var s = new SchedConfig();
-            s.Method = cmbMethod.SelectedIndex == 1 ? "cli" : "browser";
-            int pi = cmbProfile.SelectedIndex;
-            s.ProfileKey = pi >= 0 && pi < profiles.Count ? profiles[pi].Key : "";
-            s.Url = txtUrl.Text.Trim();
-            s.Text = txtText.Text;
-            s.UseTime = cmbWhen.SelectedIndex == 1;
-            s.DelaySeconds = (int)numDelay.Value;
-            s.AtTime = dtpTime.Value.ToString("HH:mm:ss");
-            s.MinWaitSeconds = (int)numMinWait.Value;
-            s.MaxWaitSeconds = (int)numMaxWait.Value;
-            s.TabCount = (int)numTabs.Value;
-            s.SendEnter = chkSend.Checked;
-            s.KeepAwake = chkAwake.Checked;
-            s.AllowScreenOff = chkScreenOff.Checked && !runner.ModernStandby;
-            s.MinBattery = (int)numBattery.Value;
-            return s;
-        }
-
-        void DoStart()
-        {
-            var s = Collect();
-            string err = runner.Start(s);
-            if (err != null) { SetStatus(err, true); return; }
-            s.Save();
-            SetRunning(true);
-        }
-
-        void SetRunning(bool running)
-        {
-            btnStart.Enabled = !running;
-            btnCancel.Enabled = running;
-        }
-
-        void SetStatus(string text, bool error)
-        {
-            lblStatus.Text = text;
-            lblStatus.ForeColor = error ? Color.Firebrick : Color.FromArgb(60, 60, 60);
-        }
-
-        // נקרא בכל פתיחה של החלון מהאייקון
-        public void Reload()
-        {
-            if (!runner.Running) LoadProfiles(SchedConfig.Load().ProfileKey);
-            SetRunning(runner.Running);
         }
     }
 }

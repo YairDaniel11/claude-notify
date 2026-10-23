@@ -22,10 +22,13 @@ namespace ClaudeNotify
     // ---------------------------------------------------------------- Program
     static class Program
     {
+        [System.Runtime.InteropServices.DllImport("user32.dll")] static extern bool SetProcessDPIAware();
+
         [STAThread]
         static void Main(string[] args)
         {
             string a0 = args.Length > 0 ? args[0] : "";
+            try { SetProcessDPIAware(); } catch { }   // ממשק חד במסכים עם סקאלה, במקום תמונה מתוחה ומטושטשת
             if (a0 == "--make-icon")
             {
                 using (var fs = File.Create(args[1])) Branding.MakeIcon(32).Save(fs);
@@ -33,20 +36,23 @@ namespace ClaudeNotify
             }
             if (a0 == "--notify") { NotifyClient.Run(); return; }
             if (a0 == "--install") { HookInstaller.Install(); return; }
+            bool runSchedule = a0 == "--run-schedule";
             if (a0 == "--uninstall") { HookInstaller.Remove(); return; }
 
+            L.Load(Config.Load().Language);
             bool created;
             using (var m = new Mutex(true, "Local\\ClaudeNotifyTray", out created))
             {
                 if (!created)
                 {
                     // כבר רץ - מבקשים ממנו לפתוח את חלון ההגדרות
-                    if (a0 != "--hidden") NotifyClient.Send("{\"__cmd\":\"settings\"}", false);
+                    // --run-schedule כשהתוכנה כבר רצה: היא שולחת בעצמה בשעה, והמשימה רק העירה את המחשב
+                    if (a0 != "--hidden" && !runSchedule) NotifyClient.Send("{\"__cmd\":\"settings\"}", false);
                     return;
                 }
                 Application.EnableVisualStyles();
                 Application.SetCompatibleTextRenderingDefault(false);
-                Application.Run(new TrayContext(a0 == "--hidden"));
+                Application.Run(new TrayContext(a0 == "--hidden" || runSchedule, runSchedule));
             }
         }
     }
@@ -54,20 +60,29 @@ namespace ClaudeNotify
     // ---------------------------------------------------------------- Branding
     static class Branding
     {
-        public static Icon MakeIcon(int size)
+        // מצייר את הסמל בגודל המדויק שנדרש, כדי שיהיה חד גם כשמגדילים אותו בממשק
+        public static Bitmap MakeBitmap(int size)
         {
             var bmp = new Bitmap(size, size);
             using (var g = Graphics.FromImage(bmp))
             {
                 g.SmoothingMode = SmoothingMode.AntiAlias;
-                g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.AntiAliasGridFit;
+                g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.AntiAlias;
                 g.Clear(Color.Transparent);
                 using (var b = new SolidBrush(Color.FromArgb(217, 119, 87)))
-                    g.FillEllipse(b, 1, 1, size - 2, size - 2);
-                using (var f = new Font("Segoe UI", size * 0.55f, FontStyle.Bold, GraphicsUnit.Pixel))
+                    g.FillEllipse(b, 0.5f, 0.5f, size - 1, size - 1);
+                using (var f = new Font("Segoe UI", size * 0.56f, FontStyle.Bold, GraphicsUnit.Pixel))
                 using (var sf = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center })
-                    g.DrawString("C", f, Brushes.White, new RectangleF(0, 0, size, size), sf);
+                    g.DrawString("C", f, Brushes.White, new RectangleF(0, size * 0.02f, size, size), sf);
             }
+            return bmp;
+        }
+
+        public static Icon MakeIcon(int size)
+        {
+            return Icon.FromHandle(MakeBitmap(size).GetHicon());
+        }
+    }
             return Icon.FromHandle(bmp.GetHicon());
         }
     }
@@ -184,10 +199,11 @@ namespace ClaudeNotify
         public int DisplaySeconds { get; set; }
         public bool UseCustomPopup { get; set; }
         public bool PopupLeft { get; set; }   // false = פינה ימנית תחתונה, true = שמאלית תחתונה
+        public string Language { get; set; }  // "he" או "en"
 
         public Config()
         {
-            DisplaySeconds = 8; UseCustomPopup = true;
+            DisplaySeconds = 8; UseCustomPopup = true; Language = "he";
             Enabled = true; Summarize = true; MaxWords = 30; SkipWhenVisible = true;
             Processes = "Code, Code - Insiders, Cursor";
         }
@@ -210,6 +226,7 @@ namespace ClaudeNotify
                         if (c.MaxWords < 5 || c.MaxWords > 100) c.MaxWords = 30;
                         if (c.DisplaySeconds < 2 || c.DisplaySeconds > 60) c.DisplaySeconds = 8;
                         if (string.IsNullOrEmpty(c.Processes)) c.Processes = "Code, Code - Insiders, Cursor";
+                        if (c.Language != "en") c.Language = "he";
                         return c;
                     }
                 }
@@ -327,6 +344,10 @@ namespace ClaudeNotify
         [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
         [DllImport("user32.dll")] static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool fAttach);
         [DllImport("kernel32.dll")] static extern uint GetCurrentThreadId();
+        [DllImport("user32.dll")] static extern bool BringWindowToTop(IntPtr h);
+        [DllImport("user32.dll")] static extern void keybd_event(byte vk, byte scan, uint flags, UIntPtr extra);
+
+        public static long Foreground() { return GetForegroundWindow().ToInt64(); }
 
         public static List<WinInfo> Find(string[] procNames)
         {
@@ -373,33 +394,46 @@ namespace ClaudeNotify
             return false;
         }
 
+        // מעלה חלון לחזית ומוודא שזה באמת קרה. הערך שמחזיר SetForegroundWindow לא אמין (הוא יכול להחזיר True
+        // והחלון בפועל לא עלה), ולכן בודקים בעצמנו מי החלון הקדמי ומנסים שוב בשיטה חזקה יותר
         public static bool Focus(long handle)
         {
             IntPtr h = new IntPtr(handle);
-            if (IsIconic(h)) ShowWindow(h, 9);
-            if (SetForegroundWindow(h)) { Log.Write("focus: direct SetForegroundWindow ok"); return true; }
+            ShowWindow(h, IsIconic(h) ? 9 : 5);
+            for (int attempt = 0; attempt < 3; attempt++)
+            {
+                if (GetForegroundWindow() == h) { Log.Write("focus: ok (attempt " + attempt + ")"); return true; }
+                TryForeground(h, attempt > 0);
+                if (GetForegroundWindow() == h) { Log.Write("focus: ok (attempt " + attempt + ")"); return true; }
+                Thread.Sleep(80);
+            }
+            Log.Write("focus: FAILED, foreground is " + GetForegroundWindow().ToInt64() + " instead of " + handle);
+            return false;
+        }
 
-            // Windows חוסם SetForegroundWindow לתהליכים שאינם בחזית - וזה כמעט תמיד המצב כאן,
-            // שכן האפליקציה רצה ברקע. העוקף המקובל: לחבר את תור הקלט שלנו לזה של התהליך שבחזית כרגע,
-            // מה שמעניק לנו זמנית את אותה הרשאה. בלי זה, עם כמה חלונות פתוחים, הקריאה נכשלת בשקט
-            // ו-VS Code ממשיך לחשוב שחלון אחר הוא זה שהיה אחרון בפוקוס.
-            uint curThread = GetCurrentThreadId();
+        // Windows חוסם SetForegroundWindow לתהליך שאינו בחזית - וזה כמעט תמיד המצב כאן, כי האפליקציה רצה
+        // ברקע וחלון ההתראה לא מקבל פוקוס (NOACTIVATE). העוקף: לחבר את תור הקלט שלנו לתור של החלון הקדמי
+        // ושל חלון היעד, ובניסיון חוזר גם "ללחוץ" על מקש חסר משמעות (F24) כדי שנחשב כמי שקיבל קלט
+        static void TryForeground(IntPtr h, bool keyTrick)
+        {
+            uint pid;
+            uint cur = GetCurrentThreadId();
             IntPtr fg = GetForegroundWindow();
-            uint fgPid;
-            uint fgThread = fg != IntPtr.Zero ? GetWindowThreadProcessId(fg, out fgPid) : 0;
-            bool attached = fgThread != 0 && fgThread != curThread && AttachThreadInput(curThread, fgThread, true);
-            bool ok;
+            uint fgThread = fg != IntPtr.Zero ? GetWindowThreadProcessId(fg, out pid) : 0;
+            uint tgtThread = GetWindowThreadProcessId(h, out pid);
+            bool a1 = fgThread != 0 && fgThread != cur && AttachThreadInput(cur, fgThread, true);
+            bool a2 = tgtThread != 0 && tgtThread != cur && tgtThread != fgThread && AttachThreadInput(cur, tgtThread, true);
             try
             {
-                ShowWindow(h, 9);
-                ok = SetForegroundWindow(h);
+                if (keyTrick) { keybd_event(0x87, 0, 0, UIntPtr.Zero); keybd_event(0x87, 0, 2, UIntPtr.Zero); }
+                BringWindowToTop(h);
+                SetForegroundWindow(h);
             }
             finally
             {
-                if (attached) AttachThreadInput(curThread, fgThread, false);
+                if (a1) AttachThreadInput(cur, fgThread, false);
+                if (a2) AttachThreadInput(cur, tgtThread, false);
             }
-            Log.Write("focus: attach=" + attached + " SetForegroundWindow=" + ok);
-            return ok;
         }
 
         // מעלה את החלון ואז פותח בו את השיחה. ה-URI מגיע לחלון ה-VS שהיה אחרון בפוקוס, ולכן קודם מעלים את החלון
@@ -417,13 +451,13 @@ namespace ClaudeNotify
                 try
                 {
                     int waited = 0;
-                    while (GetForegroundWindow() != h && waited < 1500) { Thread.Sleep(25); waited += 25; }
+                    while (GetForegroundWindow() != h && waited < 2000) { Thread.Sleep(25); waited += 25; }
                     bool reallyForeground = GetForegroundWindow() == h;
                     Log.Write("focus session: waited=" + waited + "ms foreground=" + reallyForeground + " session=" + session);
                     // ה-URI מנותב לחלון שהיה אחרון בפוקוס. אם החלון שלנו לא הגיע לחזית, שליחת ה-URI
                     // תפתח את השיחה בחלון אחר (או תיצור חלון חדש) - עדיף לא לשלוח כלל
                     if (!reallyForeground) return;
-                    Thread.Sleep(300);
+                    Thread.Sleep(400); // ל-VS Code לוקח רגע לרשום שהחלון הזה הוא האחרון בפוקוס
                     if (GetForegroundWindow() != h) { Log.Write("focus session: lost foreground, not opening"); return; }
                     var psi = new ProcessStartInfo(scheme + "://anthropic.claude-code/open?session=" + session);
                     psi.UseShellExecute = true;
@@ -433,7 +467,13 @@ namespace ClaudeNotify
             });
         }
 
-        static string SchemeFor(long handle)
+        // כותרות בעברית מגיעות עם תווי כיווניות בלתי נראים (RLM, LRE/RLE/PDF וכו') שמונעים השוואה
+        public static string CleanTitle(string t)
+        {
+            return Regex.Replace(t ?? "", "[‎‏‪-‮⁦-⁩]", "");
+        }
+
+        public static string SchemeFor(long handle)
         {
             try
             {
@@ -501,6 +541,32 @@ namespace ClaudeNotify
             return last;
         }
 
+        // כותרת השיחה כפי ש-Claude Code שומר אותה בתמלול (השורה האחרונה מנצחת). ריק אם אין
+        public static string TitleFromTranscript(string path)
+        {
+            string title = "";
+            try
+            {
+                var ser = new JavaScriptSerializer { MaxJsonLength = int.MaxValue };
+                foreach (var line in File.ReadLines(path, Encoding.UTF8))
+                {
+                    bool ai = line.IndexOf("\"ai-title\"", StringComparison.Ordinal) >= 0;
+                    bool custom = line.IndexOf("\"custom-title\"", StringComparison.Ordinal) >= 0;
+                    if (!ai && !custom) continue;
+                    try
+                    {
+                        var o = ser.Deserialize<Dictionary<string, object>>(line);
+                        string t = Str(o, ai ? "aiTitle" : "customTitle");
+                        if (t.Length == 0 && custom) t = Str(o, "title");
+                        if (t.Trim().Length > 0) title = t.Trim();
+                    }
+                    catch { }
+                }
+            }
+            catch { }
+            return title;
+        }
+
         public static string Clean(string text)
         {
             text = Regex.Replace(text, @"```[\s\S]*?```", " ");
@@ -514,7 +580,7 @@ namespace ClaudeNotify
         public static string FirstWords(string text, int max)
         {
             text = Clean(text);
-            if (text.Length == 0) return "קלוד סיים להשיב לך";
+            if (text.Length == 0) return L.T("קלוד סיים להשיב לך", "Claude finished replying");
             var words = text.Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
             string body = string.Join(" ", words, 0, Math.Min(max, words.Length));
             if (words.Length > max) body += "...";
@@ -585,6 +651,7 @@ namespace ClaudeNotify
                 else { psi.FileName = exe; psi.Arguments = args; }
                 psi.UseShellExecute = false;
                 psi.CreateNoWindow = true;
+                psi.WorkingDirectory = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
                 psi.RedirectStandardInput = true;
                 psi.RedirectStandardOutput = true;
                 psi.RedirectStandardError = true;
@@ -596,9 +663,17 @@ namespace ClaudeNotify
                     p.StandardInput.BaseStream.Write(bytes, 0, bytes.Length);
                     p.StandardInput.Close();
                     var outTask = p.StandardOutput.ReadToEndAsync();
-                    p.StandardError.ReadToEndAsync();
+                    var errTask = p.StandardError.ReadToEndAsync();
                     if (!p.WaitForExit(timeoutMs)) { try { p.Kill(); } catch { } Log.Write("summary: timeout"); error = "הזמן הקצוב עבר"; return null; }
-                    if (p.ExitCode != 0) { Log.Write("summary: exit " + p.ExitCode); error = "claude החזיר שגיאה (קוד " + p.ExitCode + ")"; return null; }
+                    if (p.ExitCode != 0)
+                    {
+                        // claude מדווח על הסיבה (לא מחובר, מכסה מלאה...) בפלט, לכן מצרפים אותה להודעת השגיאה וללוג
+                        string detail = ((errTask.Result ?? "").Trim() + " " + (outTask.Result ?? "").Trim()).Trim();
+                        if (detail.Length > 200) detail = detail.Substring(0, 200);
+                        Log.Write("summary: exit " + p.ExitCode + " " + detail);
+                        error = "claude החזיר שגיאה (קוד " + p.ExitCode + ")" + (detail.Length > 0 ? ": " + detail : "");
+                        return null;
+                    }
                     return outTask.Result.Trim();
                 }
             }
@@ -761,8 +836,11 @@ namespace ClaudeNotify
         long lastTarget;
         string lastSession = "";
 
-        public TrayContext(bool hidden)
+        readonly bool runOnce;
+
+        public TrayContext(bool hidden, bool runSchedule = false)
         {
+            runOnce = runSchedule;
             cfg = Config.Load();
             host = new Form();
             var handle = host.Handle; // יוצר handle כדי לאפשר BeginInvoke מ-threads אחרים
@@ -773,18 +851,9 @@ namespace ClaudeNotify
             tray = new NotifyIcon();
             tray.Icon = Branding.MakeIcon(32);
             tray.Text = "Claude Notify";
-            var menu = new ContextMenuStrip();
-            menu.RightToLeft = RightToLeft.Yes;
-            menu.Items.Add("הגדרות...", null, delegate { ShowSettings(); });
-            enabledItem = new ToolStripMenuItem("התראות פעילות");
-            enabledItem.Checked = cfg.Enabled;
+            enabledItem = new ToolStripMenuItem();
             enabledItem.Click += delegate { cfg.Enabled = !cfg.Enabled; cfg.Save(); SyncEnabled(); };
-            menu.Items.Add(enabledItem);
-            menu.Items.Add("התראת בדיקה", null, delegate { Show(0, "זו התראת בדיקה מ-Claude Notify. אם אתה רואה אותה, הכול עובד.", "", ""); });
-            menu.Items.Add("הודעה מתוזמנת (פתיחת מכסה)...", null, delegate { ShowSchedule(); });
-            menu.Items.Add(new ToolStripSeparator());
-            menu.Items.Add("יציאה", null, delegate { sched.Cancel(); tray.Visible = false; Application.Exit(); });
-            tray.ContextMenuStrip = menu;
+            BuildMenu();
             tray.MouseDoubleClick += delegate(object s, MouseEventArgs e) { if (e.Button == MouseButtons.Left) ShowSettings(); };
             tray.BalloonTipClicked += delegate { if (lastTarget != 0) WinApi.FocusSession(lastTarget, lastSession); };
             tray.Visible = true;
@@ -795,6 +864,28 @@ namespace ClaudeNotify
             t.Start();
 
             if (!hidden) ShowSettings();
+            if (runSchedule)
+            {
+                // הופעלנו ע"י משימת Windows בשעת השליחה: שולחים מיד לפי ההגדרות האחרונות, ואחרי ההצלחה נסגרים
+                string err = sched.Start(SchedConfig.Load(), true);
+                if (err != null) { Log.Write("run-schedule: " + err); tray.Visible = false; Environment.Exit(1); }
+            }
+        }
+
+        // בונה את תפריט האייקון (גם מחדש, אחרי החלפת שפה)
+        void BuildMenu()
+        {
+            var menu = new ContextMenuStrip();
+            menu.RightToLeft = L.He ? RightToLeft.Yes : RightToLeft.No;
+            menu.Font = new Font("Segoe UI", 12f);
+            menu.Items.Add(L.T("הגדרות...", "Settings..."), null, delegate { ShowSettings(); });
+            enabledItem.Text = L.T("התראות פעילות", "Notifications on");
+            menu.Items.Add(enabledItem);
+            menu.Items.Add(L.T("התראת בדיקה", "Test notification"), null, delegate { TestNotification(); });
+            menu.Items.Add(L.T("הודעה מתוזמנת (פתיחת מכסה)...", "Scheduled message (start quota)..."), null, delegate { ShowSchedule(); });
+            menu.Items.Add(new ToolStripSeparator());
+            menu.Items.Add(L.T("יציאה", "Exit"), null, delegate { sched.Cancel(); tray.Visible = false; Application.Exit(); });
+            tray.ContextMenuStrip = menu;
         }
 
         void SyncEnabled()
@@ -806,8 +897,8 @@ namespace ClaudeNotify
 
         void UpdateTrayText()
         {
-            string t = cfg.Enabled ? "Claude Notify - פעיל" : "Claude Notify - כבוי";
-            if (sched != null && sched.Running) t += " | מתוזמן " + sched.Target.ToString("HH:mm");
+            string t = cfg.Enabled ? "Claude Notify - " + L.T("פעיל", "on") : "Claude Notify - " + L.T("כבוי", "off");
+            if (sched != null && sched.Running) t += " | " + L.T("מתוזמן ", "scheduled ") + sched.Target.ToString("HH:mm");
             tray.Text = t;
         }
 
@@ -815,8 +906,14 @@ namespace ClaudeNotify
         {
             UpdateTrayText();
             if (sched.Cancelled) return;
-            tray.ShowBalloonTip(5000, "Claude Notify", text, error ? ToolTipIcon.Warning : ToolTipIcon.Info);
+            tray.ShowBalloonTip(5000, "Claude Notify", L.Tr(text), error ? ToolTipIcon.Warning : ToolTipIcon.Info);
             if (error) ShowSchedule();
+            else if (runOnce)
+            {
+                var t = new System.Windows.Forms.Timer { Interval = 8000 };
+                t.Tick += delegate { t.Stop(); tray.Visible = false; Application.Exit(); };
+                t.Start();
+            }
         }
 
         public void ShowSchedule()
@@ -828,7 +925,23 @@ namespace ClaudeNotify
             schedForm.Activate();
         }
 
-        public void ConfigChanged(Config c) { cfg = c; SyncEnabled(); }
+        public void ConfigChanged(Config c)
+        {
+            bool langChanged = (c.Language == "en") == L.He;
+            cfg = c;
+            L.Load(c.Language);
+            SyncEnabled();
+            if (!langChanged) return;
+            // החלפת שפה: בונים מחדש את התפריט והחלונות, ופותחים שוב את ההגדרות
+            host.BeginInvoke(new Action(delegate
+            {
+                BuildMenu();
+                UpdateTrayText();
+                if (settings != null) { settings.Dispose(); settings = null; }
+                if (schedForm != null) { schedForm.Dispose(); schedForm = null; }
+                ShowSettings();
+            }));
+        }
 
         void ShowSettings()
         {
@@ -841,7 +954,7 @@ namespace ClaudeNotify
 
         public void TestNotification()
         {
-            Show(0, "זו התראת בדיקה מ-Claude Notify. אם אתה רואה אותה, הכול עובד.", "", "");
+            Show(0, L.T("זו התראת בדיקה מ-Claude Notify. אם אתה רואה אותה, הכול עובד.", "This is a test notification from Claude Notify. If you can see it, everything works."), "", "", L.T("התראת בדיקה", "Test notification"));
         }
 
         void PipeLoop()
@@ -873,6 +986,7 @@ namespace ClaudeNotify
             if (j.ContainsKey("__cmd"))
             {
                 if (TextUtil.Str(j, "__cmd") == "settings") ShowSettings();
+                if (TextUtil.Str(j, "__cmd") == "schedule") ShowSchedule();
                 return;
             }
             if (!cfg.Enabled) { Log.Write("skipped: disabled"); return; }
@@ -880,13 +994,19 @@ namespace ClaudeNotify
             string cwd = TextUtil.Str(j, "cwd");
             string session = TextUtil.Str(j, "session_id");
             string text = TextUtil.Str(j, "last_assistant_message");
-            if (text.Trim().Length == 0)
+            string title = "";
+            string tp = TextUtil.Str(j, "transcript_path");
+            if (tp.Length > 0 && File.Exists(tp))
             {
-                string tp = TextUtil.Str(j, "transcript_path");
-                if (tp.Length > 0 && File.Exists(tp)) text = TextUtil.FromTranscript(tp);
+                title = TextUtil.TitleFromTranscript(tp);
+                if (text.Trim().Length == 0) text = TextUtil.FromTranscript(tp);
             }
 
-            long target = FindTarget(cwd);
+            // קודם מנסים לזהות את החלון לפי כותרת השיחה (היא מופיעה בתוך הפאנל של התוסף ורק בחלון שבו השיחה פתוחה),
+            // וזה מבחין גם בין כמה חלונות בלי תיקייה. אם אין כותרת או שלא נמצאה - נופלים לזיהוי לפי כותרת החלון
+            long target = title.Length > 0 ? FindByConversationTitle(title) : 0;
+            if (target != 0) Log.Write("find: matched window by conversation title [" + title + "]");
+            else target = FindTarget(cwd);
             if (cfg.SkipWhenVisible && target != 0 && WinApi.IsShown(target))
             {
                 Log.Write("skipped: editor visible");
@@ -907,11 +1027,55 @@ namespace ClaudeNotify
                     {
                         // בזמן הסיכום ייתכן שהמשתמש כבר חזר לחלון
                         if (cfg.SkipWhenVisible && target != 0 && WinApi.IsShown(target)) return;
-                        Show(target, TextUtil.FirstWords(s ?? src, max), session, cwd);
+                        Show(target, TextUtil.FirstWords(s ?? src, max), session, cwd, title);
                     }));
                 });
             }
-            else Show(target, TextUtil.FirstWords(text, max), session, cwd);
+            else Show(target, TextUtil.FirstWords(text, max), session, cwd, title);
+        }
+
+        // UI Automation: מחפש בכל חלון עורך רכיב ששמו בדיוק כותרת השיחה. רץ ב-PowerShell כדי לא להוסיף תלות בבנייה
+        const string TitleSearchPs = @"
+$ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes
+$title = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('@TITLE@'))
+$cond = New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::NameProperty, $title)
+foreach ($h in @(@HANDLES@)) {
+    try {
+        $el = [System.Windows.Automation.AutomationElement]::FromHandle([IntPtr]$h)
+        if ($el.FindFirst('Descendants', $cond) -ne $null) { 'HIT ' + $h; exit }
+    } catch { }
+}
+";
+
+        static long FindByConversationTitle(string title)
+        {
+            try
+            {
+                var wins = WinApi.Find(Config.Load().ProcessList());
+                if (wins.Count == 0) return 0;
+                var handles = new List<string>();
+                foreach (var w in wins) handles.Add(w.Handle.ToString());
+                string script = TitleSearchPs
+                    .Replace("@TITLE@", Convert.ToBase64String(Encoding.UTF8.GetBytes(title)))
+                    .Replace("@HANDLES@", string.Join(",", handles.ToArray()));
+                string enc = Convert.ToBase64String(Encoding.Unicode.GetBytes(script));
+                var psi = new ProcessStartInfo("powershell", "-NoProfile -NonInteractive -EncodedCommand " + enc);
+                psi.UseShellExecute = false;
+                psi.CreateNoWindow = true;
+                psi.RedirectStandardOutput = true;
+                psi.RedirectStandardError = true;
+                using (var p = Process.Start(psi))
+                {
+                    var outTask = p.StandardOutput.ReadToEndAsync();
+                    p.StandardError.ReadToEndAsync();
+                    if (!p.WaitForExit(8000)) { try { p.Kill(); } catch { } Log.Write("find by title: timeout"); return 0; }
+                    string o = outTask.Result.Trim();
+                    if (o.StartsWith("HIT ")) { long h; if (long.TryParse(o.Substring(4).Trim(), out h)) return h; }
+                }
+            }
+            catch (Exception ex) { Log.Write("find by title error: " + ex.Message); }
+            return 0;
         }
 
         long FindTarget(string cwd)
@@ -947,6 +1111,19 @@ namespace ClaudeNotify
                     if (t.IndexOf(" - ", StringComparison.Ordinal) < 0) { bare = w; bareCount++; }
                 }
                 if (bareCount == 1) return bare.Handle;
+                // כמה חלונות בלי תיקייה (למשל Claude שרץ בתיקיית הבית): אי אפשר לדעת מי מהם. EnumWindows מחזיר לפי סדר
+                // Z, כלומר החלון שהמשתמש עבד בו לאחרונה ראשון - זה הניחוש הטוב ביותר, והוא עדיף על חוסר יעד בכלל
+                // (בלי יעד ההתראה תמיד קופצת, והלחיצה עליה לא עושה כלום)
+                if (bareCount > 1 && bare != null)
+                {
+                    WinInfo topBare = null;
+                    foreach (var w in wins)
+                    {
+                        string t2 = Regex.Replace(w.Title, "[‎‏‪-‮⁦-⁩]", "");
+                        if (t2.IndexOf(" - ", StringComparison.Ordinal) < 0) { topBare = w; break; }
+                    }
+                    if (topBare != null) { Log.Write("find: guessing topmost folderless window for cwd=" + cwd); return topBare.Handle; }
+                }
                 Log.Write("find: no unambiguous window for cwd=" + cwd + " among " + wins.Count);
                 foreach (var w in wins) Log.Write("find: window title=[" + w.Title + "]");
             }
@@ -956,7 +1133,7 @@ namespace ClaudeNotify
 
         ToastForm toast;
 
-        void Show(long target, string body, string session, string cwd)
+        void Show(long target, string body, string session, string cwd, string title)
         {
             lastTarget = target;
             lastSession = session;
@@ -964,10 +1141,10 @@ namespace ClaudeNotify
             if (cfg.UseCustomPopup)
             {
                 if (toast != null && !toast.IsDisposed) toast.Close();
-                toast = new ToastForm(body, target, session, cwd, cfg.DisplaySeconds, cfg.PopupLeft);
+                toast = new ToastForm(body, title, target, session, cwd, cfg.DisplaySeconds, cfg.PopupLeft);
                 toast.Show();
             }
-            else tray.ShowBalloonTip(cfg.DisplaySeconds * 1000, "Claude Code", body, ToolTipIcon.None);
+            else tray.ShowBalloonTip(cfg.DisplaySeconds * 1000, string.IsNullOrEmpty(title) ? "Claude Code" : title, body, ToolTipIcon.None);
         }
     }
 
@@ -980,7 +1157,7 @@ namespace ClaudeNotify
         readonly Color borderColor = Color.FromArgb(217, 119, 87);
         int remainingMs;
 
-        public ToastForm(string body, long target, string session, string cwd, int seconds, bool left)
+        public ToastForm(string body, string heading, long target, string session, string cwd, int seconds, bool left)
         {
             this.target = target;
             this.session = session;
@@ -995,27 +1172,28 @@ namespace ClaudeNotify
             Color closeColor = light ? Color.Gray : Color.Silver;
             BackColor = bg;
             Cursor = target != 0 ? Cursors.Hand : Cursors.Default;
+            bool rtl = L.He;
 
-            const int width = 380, inner = 340;
+            int width = Theme.S(380), inner = Theme.S(340);
             var titleFont = new Font("Segoe UI", 10f, FontStyle.Bold);
             var bodyFont = new Font("Segoe UI", 10.5f);
             int textH = TextRenderer.MeasureText(body, bodyFont, new Size(inner, 0),
-                TextFormatFlags.WordBreak | TextFormatFlags.RightToLeft | TextFormatFlags.TextBoxControl).Height + 4;
+                TextFormatFlags.WordBreak | (rtl ? TextFormatFlags.RightToLeft : TextFormatFlags.Left) | TextFormatFlags.TextBoxControl).Height + 4;
 
-            var title = new Label { Text = "Claude Code", Font = titleFont, ForeColor = borderColor, AutoSize = false, Size = new Size(inner, 22), Location = new Point(20, 10), TextAlign = ContentAlignment.TopRight, RightToLeft = RightToLeft.Yes };
-            var lbl = new Label { Text = body, Font = bodyFont, ForeColor = fg, AutoSize = false, Size = new Size(inner, textH), Location = new Point(20, 36), TextAlign = ContentAlignment.TopRight, RightToLeft = RightToLeft.Yes };
-            var close = new Label { Text = "✕", Font = new Font("Segoe UI", 9f), ForeColor = closeColor, AutoSize = true, Location = new Point(4, 4), Cursor = Cursors.Hand };
+            var title = new Label { Text = string.IsNullOrEmpty(heading) ? "Claude Code" : heading, AutoEllipsis = true, Font = titleFont, ForeColor = borderColor, AutoSize = false, Size = new Size(inner, Theme.S(22)), Location = new Point(Theme.S(20), Theme.S(10)), TextAlign = ContentAlignment.TopLeft, RightToLeft = rtl ? RightToLeft.Yes : RightToLeft.No };
+            var lbl = new Label { Text = body, Font = bodyFont, ForeColor = fg, AutoSize = false, Size = new Size(inner, textH), Location = new Point(Theme.S(20), Theme.S(36)), TextAlign = ContentAlignment.TopLeft, RightToLeft = rtl ? RightToLeft.Yes : RightToLeft.No };
+            var close = new Label { Text = "✕", Font = new Font("Segoe UI", 9f), ForeColor = closeColor, AutoSize = true, Location = new Point(rtl ? Theme.S(4) : width - Theme.S(22), Theme.S(4)), Cursor = Cursors.Hand };
             close.Click += delegate { Close(); };
             Controls.Add(close);
             Controls.Add(title);
             Controls.Add(lbl);
-            Size = new Size(width, 36 + textH + 14);
+            Size = new Size(width, Theme.S(36) + textH + Theme.S(14));
 
             EventHandler click = delegate { WinApi.FocusSession(this.target, this.session); Close(); };
             Click += click; title.Click += click; lbl.Click += click;
 
             var wa = Screen.PrimaryScreen.WorkingArea;
-            Location = new Point(left ? wa.Left + 16 : wa.Right - Width - 16, wa.Bottom - Height - 16);
+            Location = new Point(left ? wa.Left + Theme.S(16) : wa.Right - Width - Theme.S(16), wa.Bottom - Height - Theme.S(16));
 
             timer.Interval = 100;
             timer.Tick += delegate
@@ -1053,202 +1231,5 @@ namespace ClaudeNotify
             base.Dispose(disposing);
         }
     }
-
-    // ---------------------------------------------------------------- Settings GUI
-    class SettingsForm : Form
-    {
-        readonly TrayContext ctx;
-        Config cfg;
-        CheckBox chkEnabled, chkSummarize, chkSkip, chkStartup, chkPopup;
-        NumericUpDown numWords, numSeconds;
-        Label lblSec, lblPos;
-        ComboBox cmbPos;
-        TextBox txtProcs;
-        Label lblStatus, lblHook;
-        Button btnInstall, btnRemove;
-        bool loading;
-
-        public SettingsForm(TrayContext ctx, Config cfg)
-        {
-            this.ctx = ctx; this.cfg = cfg;
-            Text = "Claude Notify - הגדרות";
-            Font = new Font("Segoe UI", 10f);
-            RightToLeft = RightToLeft.Yes;
-            RightToLeftLayout = true;
-            FormBorderStyle = FormBorderStyle.FixedDialog;
-            MaximizeBox = false;
-            StartPosition = FormStartPosition.CenterScreen;
-            ClientSize = new Size(560, 660);
-            Icon = Branding.MakeIcon(32);
-
-            var panel = new FlowLayoutPanel();
-            panel.Dock = DockStyle.Fill;
-            panel.FlowDirection = FlowDirection.TopDown;
-            panel.WrapContents = false;
-            panel.Padding = new Padding(16);
-            panel.RightToLeft = RightToLeft.Yes;
-            Controls.Add(panel);
-
-            lblStatus = new Label { AutoSize = true, Font = new Font("Segoe UI", 11f, FontStyle.Bold), Margin = new Padding(3, 3, 3, 10) };
-            panel.Controls.Add(lblStatus);
-
-            chkEnabled = Check(panel, "הפעל התראות");
-            chkSummarize = Check(panel, "סכם את ההודעה (איטי יותר, כ-15 שניות; אחרת תוצג תחילת ההודעה)");
-            chkSkip = Check(panel, "אל תציג התראה כשחלון העורך גלוי על המסך");
-
-            var row1 = Row(panel);
-            row1.Controls.Add(new Label { Text = "מספר מילים מקסימלי בהתראה:", AutoSize = true, Margin = new Padding(3, 6, 3, 3) });
-            numWords = new NumericUpDown { Minimum = 5, Maximum = 60, Width = 60 };
-            row1.Controls.Add(numWords);
-
-            chkPopup = Check(panel, "השתמש בחלון התראה משלי בפינת המסך (מאפשר שליטה בזמן התצוגה)");
-            var rowSec = Row(panel);
-            lblSec = new Label { Text = "זמן הצגת ההתראה (שניות):", AutoSize = true, Margin = new Padding(3, 6, 3, 3) };
-            rowSec.Controls.Add(lblSec);
-            numSeconds = new NumericUpDown { Minimum = 2, Maximum = 60, Width = 60 };
-            rowSec.Controls.Add(numSeconds);
-            var rowPos = Row(panel);
-            lblPos = new Label { Text = "מיקום ההתראה על המסך:", AutoSize = true, Margin = new Padding(3, 6, 3, 3) };
-            rowPos.Controls.Add(lblPos);
-            cmbPos = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 160, RightToLeft = RightToLeft.Yes };
-            cmbPos.Items.Add("פינה ימנית למטה");
-            cmbPos.Items.Add("פינה שמאלית למטה");
-            rowPos.Controls.Add(cmbPos);
-            chkPopup.CheckedChanged += delegate { numSeconds.Enabled = chkPopup.Checked; cmbPos.Enabled = chkPopup.Checked; };
-
-            var row2 = Row(panel);
-            row2.Controls.Add(new Label { Text = "תהליכי העורך (מופרדים בפסיק):", AutoSize = true, Margin = new Padding(3, 6, 3, 3) });
-            txtProcs = new TextBox { Width = 240, RightToLeft = RightToLeft.No };
-            row2.Controls.Add(txtProcs);
-
-            chkStartup = Check(panel, "הפעל עם Windows");
-
-            var sep = new Label { AutoSize = false, Height = 2, Width = 480, BorderStyle = BorderStyle.Fixed3D, Margin = new Padding(3, 10, 3, 10) };
-            panel.Controls.Add(sep);
-
-            lblHook = new Label { AutoSize = true, Margin = new Padding(3, 3, 3, 6) };
-            panel.Controls.Add(lblHook);
-            var hookRow = Row(panel);
-            btnInstall = new Button { Text = "התקן חיבור ל-Claude Code", AutoSize = true, Padding = new Padding(6, 2, 6, 2) };
-            btnRemove = new Button { Text = "הסר חיבור", AutoSize = true, Padding = new Padding(6, 2, 6, 2) };
-            btnInstall.Click += delegate
-            {
-                try { HookInstaller.Install(); SaveStartup(chkStartup.Checked); MessageBox.Show(this, "החיבור הותקן. אם ההתראות לא מופיעות, פתח /hooks ב-Claude Code או הפעל אותו מחדש.", "Claude Notify", MessageBoxButtons.OK, MessageBoxIcon.Information, MessageBoxDefaultButton.Button1, MessageBoxOptions.RtlReading | MessageBoxOptions.RightAlign); }
-                catch (Exception ex) { Fail(ex); }
-                Reload();
-            };
-            btnRemove.Click += delegate
-            {
-                try { HookInstaller.Remove(); } catch (Exception ex) { Fail(ex); }
-                Reload();
-            };
-            hookRow.Controls.Add(btnInstall);
-            hookRow.Controls.Add(btnRemove);
-
-            var schedRow = Row(panel);
-            schedRow.Margin = new Padding(3, 10, 3, 3);
-            var btnSched = new Button { Text = "הודעה מתוזמנת לפתיחת מכסה...", AutoSize = true, Padding = new Padding(6, 2, 6, 2) };
-            btnSched.Click += delegate { ctx.ShowSchedule(); };
-            schedRow.Controls.Add(btnSched);
-
-            var btnRow = Row(panel);
-            btnRow.Margin = new Padding(3, 18, 3, 3);
-            var btnSave = new Button { Text = "שמור", AutoSize = true, Padding = new Padding(14, 2, 14, 2) };
-            var btnTest = new Button { Text = "התראת בדיקה", AutoSize = true, Padding = new Padding(6, 2, 6, 2) };
-            btnSave.Click += delegate { Save(); Hide(); };
-            btnTest.Click += delegate { Save(); ctx.TestNotification(); };
-            btnRow.Controls.Add(btnSave);
-            btnRow.Controls.Add(btnTest);
-            AcceptButton = btnSave;
-
-            FormClosing += delegate(object s, FormClosingEventArgs e)
-            {
-                if (e.CloseReason == CloseReason.UserClosing) { e.Cancel = true; Hide(); }
-            };
-        }
-
-        static CheckBox Check(FlowLayoutPanel p, string text)
-        {
-            var c = new CheckBox { Text = text, AutoSize = true, Margin = new Padding(3, 4, 3, 4) };
-            p.Controls.Add(c);
-            return c;
-        }
-
-        static FlowLayoutPanel Row(FlowLayoutPanel p)
-        {
-            var r = new FlowLayoutPanel { AutoSize = true, FlowDirection = FlowDirection.LeftToRight, WrapContents = false, RightToLeft = RightToLeft.Yes };
-            p.Controls.Add(r);
-            return r;
-        }
-
-        void Fail(Exception ex)
-        {
-            MessageBox.Show(this, "הפעולה נכשלה: " + ex.Message, "Claude Notify", MessageBoxButtons.OK, MessageBoxIcon.Error, MessageBoxDefaultButton.Button1, MessageBoxOptions.RtlReading | MessageBoxOptions.RightAlign);
-        }
-
-        const string RunKey = @"Software\Microsoft\Windows\CurrentVersion\Run";
-
-        static bool StartupEnabled()
-        {
-            try { using (var k = Registry.CurrentUser.OpenSubKey(RunKey)) return k != null && k.GetValue("ClaudeNotify") != null; }
-            catch { return false; }
-        }
-
-        static void SaveStartup(bool on)
-        {
-            try
-            {
-                using (var k = Registry.CurrentUser.OpenSubKey(RunKey, true))
-                {
-                    if (on)
-                    {
-                        string exe = File.Exists(HookInstaller.InstalledExe) ? HookInstaller.InstalledExe : Application.ExecutablePath;
-                        k.SetValue("ClaudeNotify", "\"" + exe + "\" --hidden");
-                    }
-                    else k.DeleteValue("ClaudeNotify", false);
-                }
-            }
-            catch { }
-        }
-
-        public void Reload()
-        {
-            loading = true;
-            cfg = Config.Load();
-            chkEnabled.Checked = cfg.Enabled;
-            chkSummarize.Checked = cfg.Summarize;
-            chkSkip.Checked = cfg.SkipWhenVisible;
-            numWords.Value = Math.Max(numWords.Minimum, Math.Min(numWords.Maximum, cfg.MaxWords));
-            txtProcs.Text = cfg.Processes;
-            chkPopup.Checked = cfg.UseCustomPopup;
-            numSeconds.Value = Math.Max(numSeconds.Minimum, Math.Min(numSeconds.Maximum, cfg.DisplaySeconds));
-            numSeconds.Enabled = cfg.UseCustomPopup;
-            cmbPos.SelectedIndex = cfg.PopupLeft ? 1 : 0;
-            cmbPos.Enabled = cfg.UseCustomPopup;
-            chkStartup.Checked = StartupEnabled();
-            bool inst = HookInstaller.IsInstalled();
-            lblHook.Text = inst ? "החיבור ל-Claude Code: מותקן" : "החיבור ל-Claude Code: לא מותקן (נדרש כדי לקבל התראות)";
-            lblHook.ForeColor = inst ? Color.DarkGreen : Color.Firebrick;
-            btnInstall.Text = inst ? "התקן מחדש" : "התקן חיבור ל-Claude Code";
-            btnRemove.Enabled = inst;
-            lblStatus.Text = cfg.Enabled ? "ההתראות פעילות" : "ההתראות כבויות";
-            loading = false;
-        }
-
-        void Save()
-        {
-            if (loading) return;
-            cfg.Enabled = chkEnabled.Checked;
-            cfg.Summarize = chkSummarize.Checked;
-            cfg.SkipWhenVisible = chkSkip.Checked;
-            cfg.MaxWords = (int)numWords.Value;
-            cfg.UseCustomPopup = chkPopup.Checked;
-            cfg.DisplaySeconds = (int)numSeconds.Value;
-            cfg.PopupLeft = cmbPos.SelectedIndex == 1;
-            cfg.Processes = txtProcs.Text.Trim().Length > 0 ? txtProcs.Text.Trim() : "Code, Code - Insiders, Cursor";
-            cfg.Save();
-            SaveStartup(chkStartup.Checked);
-            ctx.ConfigChanged(cfg);
-        }
-    }
 }
+
