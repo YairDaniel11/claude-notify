@@ -703,6 +703,7 @@ try {
             Target = target;
             deadline = target;
             prefix = (cfg.Method == "browser" ? "הדפדפן ייפתח " : "ההודעה תישלח ") + when;
+            Log.Write("schedule: start method=" + cfg.Method + " newChat=" + cfg.NewChat);
             wantAwake = cfg.KeepAwake;
             allowScreenOff = cfg.AllowScreenOff && !modernStandby;
             awakeOn = false;
@@ -1010,7 +1011,8 @@ try {
                 if (exclude != null && exclude.Contains(RuntimeKey(e))) continue;
                 cands.Add(e);
             }
-            if (cands.Count <= 1) return cands.Count == 1 ? cands[0] : null;
+            if (cands.Count == 0) { LogEdits(root); return null; }
+            if (cands.Count == 1) return cands[0];
 
             NRect w;
             bool haveRect = Native.GetWindowRect(new IntPtr(hwnd), out w) && w.R > w.L && w.B > w.T;
@@ -1055,6 +1057,28 @@ try {
             if (pick == null) { pick = cands[0]; why = "first visible (no information)"; }
             Log.Write("schedule: " + cands.Count + " visible inputs:" + log + " -> picked: " + why);
             return pick;
+        }
+
+        static DateTime lastEditDump = DateTime.MinValue;
+
+        // אבחון: כשלא נמצאה תיבת "Message input", רושם ללוג את שמות כל תיבות הטקסט שהחלון חושף (פעם ב-10 שניות)
+        static void LogEdits(AutomationElement root)
+        {
+            if ((DateTime.Now - lastEditDump).TotalSeconds < 10) return;
+            lastEditDump = DateTime.Now;
+            try
+            {
+                var all = root.FindAll(TreeScope.Descendants, new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Edit));
+                var sb = new StringBuilder();
+                int n = 0;
+                foreach (AutomationElement e in all)
+                {
+                    if (n++ >= 30) break;
+                    sb.Append(" [\"" + e.Current.Name + "\"" + (e.Current.IsOffscreen ? " offscreen" : "") + "]");
+                }
+                Log.Write("schedule: no visible 'Message input' found. Edit elements in window (" + n + "):" + sb);
+            }
+            catch (Exception ex) { Log.Write("schedule: edit dump failed: " + ex.Message); }
         }
 
         // מרכז האלמנט ביחס לחלון (0..1). קורא את ה-Rect דרך reflection, כדי לא להוסיף הפניה ל-WindowsBase ל-build.cmd
