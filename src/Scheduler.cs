@@ -201,8 +201,12 @@ namespace ClaudeNotify
         public uint BatteryLifeTime, BatteryFullLifeTime;
     }
 
+    [StructLayout(LayoutKind.Sequential)]
+    struct NRect { public int L, T, R, B; }
+
     static class Native
     {
+        [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out NRect r);
         [DllImport("user32.dll")] public static extern void keybd_event(byte vk, byte scan, uint flags, UIntPtr extra);
         [DllImport("user32.dll")] public static extern void mouse_event(uint flags, int dx, int dy, uint data, UIntPtr extra);
         [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
@@ -493,6 +497,96 @@ namespace ClaudeNotify
         }
     }
 
+    // ---------------------------------------------------------------- מעקב אחרי תיבת ההקלדה שבה המשתמש עבד
+    // כשבחלון VS Code יש כמה פאנלים של Claude (למשל שיחה בלשונית עורך + שיחה בסרגל הצד), אי אפשר לדעת מתוך החלון לבדו
+    // באיזה מהם המשתמש עבד. בזמן שתזמון "המשך בשיחה הפעילה" ממתין, שרשור רקע בודק אחת לכמה זמן: אם חלון העורך בחזית
+    // והפוקוס בתיבת "Message input", זוכרים איזו תיבה זו (מזהה + מיקום יחסי בחלון). בשעת השליחה מעדיפים אותה.
+    static class InputTracker
+    {
+        public class Mark
+        {
+            public string Id = "";
+            public double RelX, RelY;   // מרכז התיבה ביחס לחלון (0..1)
+        }
+
+        static readonly object gate = new object();
+        static readonly Dictionary<long, Mark> marks = new Dictionary<long, Mark>();
+        static string[] procs = new string[0];
+        static bool run;
+        static Thread th;
+
+        public static void Start(string[] processNames)
+        {
+            lock (gate)
+            {
+                procs = processNames ?? new string[0];
+                marks.Clear();
+                run = true;
+                if (th != null && th.IsAlive) return;
+                th = new Thread(Loop);
+                th.IsBackground = true;
+                th.Name = "InputTracker";
+                th.Start();
+            }
+        }
+
+        // עוצר את המעקב אבל משאיר את מה שנאסף (השליחה עצמה מעלה את החלון לחזית ומשנה פוקוס, וזה לא צריך לדרוס את הסימון)
+        public static void Stop()
+        {
+            lock (gate) run = false;
+        }
+
+        public static Mark Get(long hwnd)
+        {
+            lock (gate)
+            {
+                Mark m;
+                return marks.TryGetValue(hwnd, out m) ? m : null;
+            }
+        }
+
+        static bool Running { get { lock (gate) return run; } }
+
+        static void Loop()
+        {
+            while (Running)
+            {
+                try { Poll(); }
+                catch (Exception ex) { Log.Write("input tracker: " + ex.Message); }
+                Thread.Sleep(700);
+            }
+        }
+
+        static void Poll()
+        {
+            IntPtr fg = Native.GetForegroundWindow();
+            if (fg == IntPtr.Zero) return;
+            string pn = Power.ForegroundProcessName();
+            bool editor = false;
+            string[] list;
+            lock (gate) list = procs;
+            foreach (var p in list) if (p.Equals(pn, StringComparison.OrdinalIgnoreCase)) editor = true;
+            if (!editor) return;
+
+            AutomationElement f = AutomationElement.FocusedElement;
+            if (f == null) return;
+            if (f.Current.ControlType != ControlType.Edit || f.Current.Name != "Message input") return;
+            NRect w;
+            if (!Native.GetWindowRect(fg, out w) || w.R <= w.L || w.B <= w.T) return;
+            double rx, ry;
+            if (!ScheduleRunner.RelCenter(f, w, out rx, out ry)) return;
+            var m = new Mark { Id = ScheduleRunner.RuntimeKey(f), RelX = rx, RelY = ry };
+            lock (gate)
+            {
+                if (!run) return;
+                Mark old;
+                if (!marks.TryGetValue(fg.ToInt64(), out old) || old.Id != m.Id)
+                    Log.Write("input tracker: active input in window " + fg.ToInt64() + " at x=" + rx.ToString("0.00") + " y=" + ry.ToString("0.00"));
+                marks[fg.ToInt64()] = m;
+            }
+        }
+    }
+
     // ---------------------------------------------------------------- Schedule runner
     // רץ כולו על ה-thread של הממשק (טיימר אחד), כמו ב-tkinter של הסקריפט המקורי.
     // הוא שייך ל-TrayContext ולא לחלון, ולכן סגירת החלון לא מבטלת את התזמון.
@@ -616,6 +710,8 @@ try {
             runId++;
             phase = Phase.WaitStart;
             taskRegistered = false;
+            // "המשך בשיחה הפעילה": זוכרים באיזו תיבת הקלדה המשתמש עבד, כדי לא לשלוח לפאנל אחר באותו חלון
+            if (cfg.Method == "vscode" && !cfg.NewChat) InputTracker.Start(Config.Load().ProcessList());
             if (!immediate && (target - DateTime.Now).TotalSeconds >= 90)
             {
                 TaskSched.Register(target, cfg.Wake);
@@ -718,6 +814,7 @@ try {
         // (או ממשיכים בשיחה הפעילה), מדביקים את הטקסט ב"Message input" ולוחצים Enter. כשל בחלון אחד לא עוצר את האחרים
         void SendToVsCodeWindow()
         {
+            InputTracker.Stop();   // מכאן אנחנו משנים פוקוס בעצמנו, ולכן מקפיאים את מה שנאסף
             Power.WakeDisplay();
             if (Power.IsLocked()) { Finish("המחשב היה נעול בשעת ההפעלה, ולכן לא נעשה כלום", true); return; }
             VsBegin();
@@ -856,7 +953,7 @@ try {
             if (Native.GetForegroundWindow().ToInt64() != vsHandle) WinApi.Focus(vsHandle);
             AutomationElement input = null;
             bool allowOld = DateTime.Now > vsNewInputUntil;
-            try { input = FindMessageInput(vsHandle, allowOld ? null : vsOldInputs); }
+            try { input = FindMessageInput(vsHandle, allowOld ? null : vsOldInputs, !c.NewChat); }
             catch (Exception ex) { Log.Write("uia error: " + ex.Message); }
             if (input == null)
             {
@@ -896,22 +993,89 @@ try {
             Next(1000);
         }
 
-        // מחזיר את תיבת ההקלדה הנראית בחלון (עדיפות לזו שיש בה פוקוס). exclude = תיבות שהיו כבר לפני שפתחנו שיחה חדשה
-        static AutomationElement FindMessageInput(long hwnd, HashSet<string> exclude)
+        // מחזיר את תיבת ההקלדה הנראית בחלון. exclude = תיבות שהיו כבר לפני שפתחנו שיחה חדשה.
+        // useMark = מצב "המשך בשיחה הפעילה". כשיש כמה תיבות גלויות (פאנל בעורך + פאנל בסרגל הצד) סדר העדיפויות:
+        //   1. התיבה שבה המשתמש עבד לאחרונה (InputTracker)   2. התיבה שיש בה פוקוס כרגע   3. הראשונה ברשימה
+        // לפני התיקון נבחרה רק לפי פוקוס, ובלעדיו - תמיד הראשונה, שהיא בדרך כלל פאנל העורך ולא הפאנל שבו עבדו
+        static AutomationElement FindMessageInput(long hwnd, HashSet<string> exclude, bool useMark)
         {
             var root = AutomationElement.FromHandle(new IntPtr(hwnd));
             var cond = new AndCondition(
                 new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Edit),
                 new PropertyCondition(AutomationElement.NameProperty, "Message input"));
-            AutomationElement best = null;
+            var cands = new List<AutomationElement>();
             foreach (AutomationElement e in root.FindAll(TreeScope.Descendants, cond))
             {
                 if (e.Current.IsOffscreen) continue;
                 if (exclude != null && exclude.Contains(RuntimeKey(e))) continue;
-                if (e.Current.HasKeyboardFocus) return e;
-                if (best == null) best = e;
+                cands.Add(e);
             }
-            return best;
+            if (cands.Count <= 1) return cands.Count == 1 ? cands[0] : null;
+
+            NRect w;
+            bool haveRect = Native.GetWindowRect(new IntPtr(hwnd), out w) && w.R > w.L && w.B > w.T;
+            var keys = new string[cands.Count];
+            var xs = new double[cands.Count];
+            var ys = new double[cands.Count];
+            var has = new bool[cands.Count];
+            AutomationElement focused = null;
+            var log = new StringBuilder();
+            for (int i = 0; i < cands.Count; i++)
+            {
+                keys[i] = RuntimeKey(cands[i]);
+                has[i] = haveRect && RelCenter(cands[i], w, out xs[i], out ys[i]);
+                bool f = false;
+                try { f = cands[i].Current.HasKeyboardFocus; } catch { }
+                if (f && focused == null) focused = cands[i];
+                log.Append(" [#" + i + " x=" + (has[i] ? xs[i].ToString("0.00") : "?") + " y=" + (has[i] ? ys[i].ToString("0.00") : "?") + (f ? " focus" : "") + "]");
+            }
+
+            AutomationElement pick = null;
+            string why = "";
+            InputTracker.Mark m = useMark ? InputTracker.Get(hwnd) : null;
+            if (m != null)
+            {
+                int best = -1;
+                for (int i = 0; i < cands.Count && best < 0; i++) if (keys[i] == m.Id) best = i;
+                if (best >= 0) why = "same input as the one last used";
+                else
+                {
+                    double bd = 0.2;   // רק אם התיבה קרובה למקום שבו עבדו (ביחס לגודל החלון)
+                    for (int i = 0; i < cands.Count; i++)
+                    {
+                        if (!has[i]) continue;
+                        double d = Math.Sqrt((xs[i] - m.RelX) * (xs[i] - m.RelX) + (ys[i] - m.RelY) * (ys[i] - m.RelY));
+                        if (d < bd) { bd = d; best = i; }
+                    }
+                    if (best >= 0) why = "closest to where the user last worked";
+                }
+                if (best >= 0) pick = cands[best];
+            }
+            if (pick == null && focused != null) { pick = focused; why = "has keyboard focus"; }
+            if (pick == null) { pick = cands[0]; why = "first visible (no information)"; }
+            Log.Write("schedule: " + cands.Count + " visible inputs:" + log + " -> picked: " + why);
+            return pick;
+        }
+
+        // מרכז האלמנט ביחס לחלון (0..1). קורא את ה-Rect דרך reflection, כדי לא להוסיף הפניה ל-WindowsBase ל-build.cmd
+        internal static bool RelCenter(AutomationElement e, NRect w, out double rx, out double ry)
+        {
+            rx = 0; ry = 0;
+            try
+            {
+                object r = e.GetCurrentPropertyValue(AutomationElement.BoundingRectangleProperty);
+                if (r == null) return false;
+                Type t = r.GetType();
+                double x = Convert.ToDouble(t.GetProperty("X").GetValue(r, null));
+                double y = Convert.ToDouble(t.GetProperty("Y").GetValue(r, null));
+                double wd = Convert.ToDouble(t.GetProperty("Width").GetValue(r, null));
+                double ht = Convert.ToDouble(t.GetProperty("Height").GetValue(r, null));
+                if (double.IsNaN(x) || double.IsInfinity(x) || double.IsNaN(wd) || double.IsInfinity(wd) || wd <= 0 || ht <= 0) return false;
+                rx = (x + wd / 2 - w.L) / (w.R - w.L);
+                ry = (y + ht / 2 - w.T) / (w.B - w.T);
+                return true;
+            }
+            catch { return false; }
         }
 
         static HashSet<string> CurrentInputs(long hwnd)
@@ -929,7 +1093,7 @@ try {
             return set;
         }
 
-        static string RuntimeKey(AutomationElement e)
+        internal static string RuntimeKey(AutomationElement e)
         {
             int[] id = e.GetRuntimeId();
             return id == null ? "" : string.Join(",", Array.ConvertAll(id, x => x.ToString()));
@@ -1255,6 +1419,7 @@ try {
         void Finish(string text, bool error)
         {
             timer.Stop();
+            InputTracker.Stop();
             RestoreClipboard();
             phase = Phase.Idle;
             vsQueue.Clear();
