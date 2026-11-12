@@ -531,7 +531,7 @@ namespace ClaudeNotify
                 lbl.SetBounds(pad, pad, w - pad * 2, bodyH);
                 var ok = new PillButton(L.T("אישור", "OK"), true);
                 ok.Top = pad + bodyH + Theme.S(18);
-                ok.Left = rtl ? w - pad - ok.Width : pad;
+                ok.Left = pad;   // כפתור האישור תמיד בצד שמאל
                 ok.Click += delegate { f.Close(); };
                 f.ClientSize = new Size(w, ok.Bottom + pad);
                 f.Controls.Add(lbl); f.Controls.Add(ok);
