@@ -48,6 +48,17 @@ namespace ClaudeNotify
             };
         }
 
+        // שומר תמונה של כל התוכן של החלון בגובהו המלא (גם החלק שדורש גלילה). לצילומי מסך לתיעוד
+        public void SaveContentImage(string path)
+        {
+            FitContent();
+            using (var bmp = new Bitmap(content.Width, content.Height))
+            {
+                content.DrawToBitmap(bmp, new Rectangle(0, 0, content.Width, content.Height));
+                bmp.Save(path, System.Drawing.Imaging.ImageFormat.Png);
+            }
+        }
+
         protected void FitContent()
         {
             content.Width = Math.Max(300, host.ClientSize.Width);
@@ -89,7 +100,10 @@ namespace ClaudeNotify
         {
             this.ctx = ctx; this.cfg = cfg;
 
-            header = new Header(L.T("הגדרות", "Settings"), "", null);
+            var btnHelp = new PillButton(L.T("עזרה", "Help"), false);
+            btnHelp.Height = Theme.S(30);
+            btnHelp.Click += delegate { ctx.ShowHelp(); };
+            header = new Header(L.T("הגדרות", "Settings"), "", btnHelp);
             content.Controls.Add(header);
 
             // ---- התראות
@@ -113,6 +127,7 @@ namespace ClaudeNotify
             posRow = AddRow(cn, L.T("מיקום על המסך", "Position on screen"), null, cmbPos, false, 220, null);
             tglPopup.CheckedChanged += delegate { numSeconds.Enabled = tglPopup.Checked; cmbPos.Enabled = tglPopup.Checked; };
             content.Controls.Add(cn);
+
 
             // ---- כללי
             var cg = new Card(L.T("כללי", "General"));
@@ -139,6 +154,9 @@ namespace ClaudeNotify
 
             // ---- כלים: שני החלונות הנוספים של התוכנה
             var ct = new Card(L.T("כלים", "Tools"));
+            var btnVoice = new PillButton(L.T("פתח", "Open"), false);
+            btnVoice.Click += delegate { ctx.ShowVoice(); };
+            AddRow(ct, L.T("קריאה בקול", "Voice call"), L.T("המחשב קורא לך בקול כש-Claude מסיים, ואפשר לענות לו בקול ואפילו להכתיב לו הוראה.", "The computer calls you out loud when Claude finishes, and you can answer by voice and even dictate an instruction."), btnVoice, false, 100, null);
             var btnSched = new PillButton(L.T("פתח", "Open"), false);
             btnSched.Click += delegate { ctx.ShowSchedule(); };
             AddRow(ct, L.T("הודעה מתוזמנת", "Scheduled message"), L.T("שליחת הודעה קצרה לקלוד בשעה שתבחר, כדי להתחיל את מכסת 5 השעות מראש.", "Sends Claude a short message at a time you choose, to start the 5-hour quota window early."), btnSched, false, 100, null);
@@ -166,11 +184,9 @@ namespace ClaudeNotify
             // ---- שורת כפתורים תחתונה
             var flow = new FlowLayoutPanel { Dock = DockStyle.Fill, Padding = Theme.P(18, 10, 18, 0), WrapContents = false, BackColor = Color.White, FlowDirection = L.He ? FlowDirection.RightToLeft : FlowDirection.LeftToRight };
             var btnSave = new PillButton(L.T("שמור", "Save"), true);
-            var btnTest = new PillButton(L.T("התראת בדיקה", "Test notification"), false);
-            btnSave.Margin = btnTest.Margin = Theme.P(0, 0, 10, 0);
+            btnSave.Margin = Theme.P(0, 0, 10, 0);
             btnSave.Click += delegate { Save(); Hide(); };
-            btnTest.Click += delegate { Save(); ctx.TestNotification(); };
-            flow.Controls.Add(btnSave); flow.Controls.Add(btnTest);
+            flow.Controls.Add(btnSave);
             bar.Controls.Add(flow);
             AcceptButton = btnSave;
             Reload();
@@ -235,6 +251,7 @@ namespace ClaudeNotify
         void Save()
         {
             if (loading) return;
+            cfg = Config.Load();
             cfg.Enabled = tglEnabled.Checked;
             cfg.Summarize = tglSummarize.Checked;
             cfg.SkipWhenVisible = tglSkip.Checked;
@@ -247,6 +264,149 @@ namespace ClaudeNotify
             cfg.Processes = procs.Length > 0 ? procs : "Code, Code - Insiders, Cursor";
             cfg.Save();
             SaveStartup(tglStartup.Checked);
+            ctx.ConfigChanged(cfg);
+        }
+    }
+
+
+    // ---------------------------------------------------------------- Voice call settings
+    class VoiceForm : PageForm
+    {
+        readonly TrayContext ctx;
+        Config cfg;
+        ToggleSwitch tglVoice, tglListen, tglShowWin, tglNatural, tglAnnounce, tglNikud, tglDictate, tglNeedSend, tglLowMem;
+        Dropdown cmbGender, cmbRate, cmbVLang, cmbWinPos;
+        static readonly string[] PosKeys = { "br", "bl", "tr", "tl", "center" };
+        static readonly double[] Rates = { 0.85, 0.92, 1.0, 1.15, 1.3, 1.5 };
+        Field fldName, fldHotkey;
+        Stepper numRepeats, numIdle;
+        bool loading;
+
+        public VoiceForm(TrayContext ctx) : base("Claude Notify - " + L.T("קריאה בקול", "Voice call"), 60)
+        {
+            this.ctx = ctx;
+            content.Controls.Add(new Header(L.T("קריאה בקול", "Voice call"),
+                L.T("כשאתה לא ליד המחשב - הוא קורא לך בקול, ואפשר לענות לו.", "When you are away from the computer, it calls you out loud, and you can answer."), null));
+
+            var cv = new Card(L.T("קריאה בקול", "Voice call"));
+            tglVoice = new ToggleSwitch();
+            AddRow(cv, L.T("קרא לי בקול", "Call me out loud"), L.T("כשהמחשב אומר בקול שקלוד סיים - לשימוש כשאני לא ליד המחשב.", "Speaks out loud when Claude finishes - for when you are away from the computer."), tglVoice, false, 54, null);
+            numRepeats = Ctl.Num(1, 10);
+            AddRow(cv, L.T("כמה פעמים לקרוא", "How many times to call"), L.T("מספר הקריאות ברצף, עד שעונים לו.", "Number of calls in a row, until you answer."), numRepeats, false, 124, null);
+            numIdle = Ctl.Num(0, 600);
+            AddRow(cv, L.T("קרא רק אם לא נגעתי במחשב (שניות)", "Call only if I did not touch the computer (seconds)"), L.T("אם אתה עובד על המחשב, הוא לא יקרא לך. 0 = תמיד לקרוא. אם חוזרים למחשב באמצע - הקריאות נפסקות.", "If you are working at the computer, it will not call you. 0 = always call. If you come back in the middle, the calls stop."), numIdle, false, 124, null);
+            tglListen = new ToggleSwitch();
+            AddRow(cv, L.T("האזן לתשובה שלי", "Listen for my answer"), L.T("אומרים \"שנייה אני מגיע\" והוא מפסיק לקרוא. משתמש בזיהוי הדיבור של Edge/Chrome ודורש מיקרופון.", "Say \"just a second, I'm coming\" and it stops calling. Uses Edge/Chrome speech recognition and needs a microphone."), tglListen, false, 54, null);
+            tglDictate = new ToggleSwitch();
+            AddRow(cv, L.T("הכתבה ל-Claude", "Dictate to Claude"), L.T("אחרי שאמרת שאתה מגיע - מקלידה בתיבת השיחה את מה שתגיד (\"כן, אני מאשר...\"). דורש \"האזן לתשובה שלי\".", "After you say you are coming, types what you say into the chat box (\"yes, I approve...\"). Needs \"Listen for my answer\"."), tglDictate, false, 54, null);
+            tglNeedSend = new ToggleSwitch();
+            AddRow(cv, L.T("שלח רק כשאני אומר \"שלח\"", "Send only when I say \"send\""), L.T("דלוק = ההודעה רק מוקלדת, ונשלחת כשמסיימים במילה \"שלח\". כבוי = נשלחת לבד אחרי כמה שניות של שקט.", "On = the message is only typed, and sent when you end with the word \"send\". Off = sent automatically after a few seconds of silence."), tglNeedSend, false, 54, null);
+            tglShowWin = new ToggleSwitch();
+            AddRow(cv, L.T("הצג את חלון ההאזנה", "Show the listening window"), L.T("דלוק = חלון קטן שמראה מה שהוא שומע ממך. כבוי = החלון מוסתר.", "On = a small window showing what it hears from you. Off = the window is hidden."), tglShowWin, false, 54, null);
+            tglNikud = new ToggleSwitch();
+            AddRow(cv, L.T("נקד לפני הקראה", "Add nikud before speaking"), L.T("Claude מנקד את הסיכום, והקול מבטא נכון יותר. דורש הפעלת \"סכם את ההודעה\", נספר במכסה.", "Claude adds vowel marks to the summary so the voice pronounces it better. Needs \"Summarize the message\" on; counts against your quota."), tglNikud, false, 54, null);
+            tglLowMem = new ToggleSwitch();
+            AddRow(cv, L.T("חיסכון בזיכרון", "Save memory"), L.T("סוגר את דף הדפדפן כשהקריאה בקול כבויה. ההקראה הראשונה אחרי ההפעלה תתעכב כמה שניות.", "Closes the browser page while voice call is off. The first speech after turning it on is delayed by a few seconds."), tglLowMem, false, 54, null);
+            tglAnnounce = new ToggleSwitch();
+            AddRow(cv, L.T("הודע על הפעלה וכיבוי", "Announce on/off"), L.T("אומר בקול \"הקריאה בקול הופעלה/כבויה\" כשמחליפים את המצב.", "Says \"Voice call is on/off\" out loud when you switch it."), tglAnnounce, false, 54, null);
+            tglNatural = new ToggleSwitch();
+            AddRow(cv, L.T("קול טבעי", "Natural voice"), L.T("קול איכותי של Edge במקום הקול הרובוטי של Windows. אם אין קול כזה - נעשה שימוש בקול של Windows.", "A high-quality Edge voice instead of the robotic Windows voice. If none is available, the Windows voice is used."), tglNatural, false, 54, null);
+            cmbVLang = Ctl.Combo(200, L.He);
+            cmbVLang.Items.Add(L.T("לפי שפת הממשק", "Same as the interface"));
+            cmbVLang.Items.Add("עברית");
+            cmbVLang.Items.Add("English");
+            AddRow(cv, L.T("שפת הדיבור", "Speaking language"), L.T("השפה שבה הוא מדבר, מקשיב ומסכם. אם אתה עונה לו בעברית - בחר עברית.", "The language it speaks, listens and summarizes in. If you answer in Hebrew - choose Hebrew."), cmbVLang, false, 200, null);
+            cmbGender = Ctl.Combo(200, L.He);
+            cmbGender.Items.Add(L.T("קול גבר", "Male voice"));
+            cmbGender.Items.Add(L.T("קול אישה", "Female voice"));
+            AddRow(cv, L.T("סוג הקול", "Voice type"), L.T("חל על הקול הטבעי. הקול של Windows בעברית הוא גבר בלבד.", "Applies to the natural voice. The Windows Hebrew voice is male only."), cmbGender, false, 200, null);
+            cmbRate = Ctl.Combo(200, L.He);
+            foreach (var n in new[] { L.T("איטי", "Slow"), L.T("מעט איטי", "A bit slow"), L.T("רגיל", "Normal"), L.T("מעט מהיר", "A bit fast"), L.T("מהיר", "Fast"), L.T("מהיר מאוד", "Very fast") }) cmbRate.Items.Add(n);
+            AddRow(cv, L.T("מהירות הקראה", "Speaking speed"), L.T("\"רגיל\" הוא המהירות הרגילה של הקול.", "\"Normal\" is the voice's normal speed."), cmbRate, false, 200, null);
+            var btnSpeak = new PillButton(L.T("בדוק", "Test"), false);
+            btnSpeak.Click += delegate { Save(); ctx.TestSpeak(); };
+            AddRow(cv, L.T("בדיקת הקראה", "Test speaking"), L.T("מקריא משפט לדוגמה.", "Speaks a sample sentence."), btnSpeak, false, 100, null);
+            var btnListen = new PillButton(L.T("בדוק", "Test"), false);
+            btnListen.Click += delegate { Save(); ctx.TestListen(); };
+            AddRow(cv, L.T("בדיקת האזנה", "Test listening"), L.T("מאזין 12 שניות ומציג מה שמע. אמור למשל \"שנייה אני מגיע\".", "Listens for 12 seconds and shows what it heard. Try saying \"just a second, I'm coming\"."), btnListen, false, 100, null);
+            cmbWinPos = Ctl.Combo(220, L.He);
+            foreach (var n in new[] { L.T("פינה ימנית למטה", "Bottom right"), L.T("פינה שמאלית למטה", "Bottom left"), L.T("פינה ימנית למעלה", "Top right"), L.T("פינה שמאלית למעלה", "Top left"), L.T("מרכז המסך", "Center of the screen") }) cmbWinPos.Items.Add(n);
+            AddRow(cv, L.T("מיקום חלון ההאזנה", "Listening window position"), L.T("איפה על המסך יופיע חלון ההאזנה.", "Where on the screen the listening window appears."), cmbWinPos, false, 220, null);
+            fldName = new Field(L.He);
+            AddRow(cv, L.T("השם שלי", "My name"), L.T("בשם הזה קלוד יקרא לך.", "The name Claude calls you by."), fldName, true, 0, null);
+            fldHotkey = new Field(false);
+            fldHotkey.Box.ReadOnly = true;
+            fldHotkey.Box.KeyDown += delegate(object s, KeyEventArgs e)
+            {
+                e.SuppressKeyPress = true; e.Handled = true;
+                Keys k = e.KeyCode;
+                if (k == Keys.ControlKey || k == Keys.Menu || k == Keys.ShiftKey || k == Keys.LWin || k == Keys.RWin) return;
+                if (k == Keys.Back || k == Keys.Delete) { fldHotkey.Box.Text = ""; return; }
+                string t = (e.Control ? "Ctrl+" : "") + (e.Alt ? "Alt+" : "") + (e.Shift ? "Shift+" : "");
+                if (t.Length == 0) return; // חובה מקש שינוי אחד לפחות
+                fldHotkey.Box.Text = t + k;
+            };
+            AddRow(cv, L.T("קיצור מקשים להפעלה/כיבוי", "Hotkey to turn on/off"), L.T("לחץ בתוך התיבה על השילוב הרצוי (למשל Ctrl+Alt+V). Backspace מנקה.", "Click the box and press the combination (for example Ctrl+Alt+V). Backspace clears."), fldHotkey, true, 0, null);
+            content.Controls.Add(cv);
+
+            var flow = new FlowLayoutPanel { Dock = DockStyle.Fill, Padding = Theme.P(18, 10, 18, 0), WrapContents = false, BackColor = Color.White, FlowDirection = L.He ? FlowDirection.RightToLeft : FlowDirection.LeftToRight };
+            var btnSave = new PillButton(L.T("שמור", "Save"), true);
+            btnSave.Click += delegate { Save(); Hide(); };
+            flow.Controls.Add(btnSave);
+            bar.Controls.Add(flow);
+            AcceptButton = btnSave;
+            Reload();
+        }
+
+        public void Reload()
+        {
+            loading = true;
+            cfg = Config.Load();
+            tglVoice.Checked = cfg.VoiceEnabled;
+            numRepeats.Value = Math.Max(numRepeats.Minimum, Math.Min(numRepeats.Maximum, cfg.VoiceRepeats));
+            numIdle.Value = Math.Max(numIdle.Minimum, Math.Min(numIdle.Maximum, cfg.VoiceIdleSeconds));
+            tglListen.Checked = cfg.VoiceListen;
+            tglShowWin.Checked = cfg.VoiceShowWindow;
+            tglNatural.Checked = cfg.VoiceNatural;
+            tglAnnounce.Checked = cfg.VoiceAnnounce;
+            tglNikud.Checked = cfg.VoiceNikud;
+            tglDictate.Checked = cfg.VoiceDictate;
+            tglNeedSend.Checked = cfg.VoiceNeedSend;
+            tglLowMem.Checked = cfg.VoiceLowMem;
+            cmbGender.SelectedIndex = cfg.VoiceGender == "female" ? 1 : 0;
+            cmbVLang.SelectedIndex = cfg.VoiceLang == "he" ? 1 : (cfg.VoiceLang == "en" ? 2 : 0);
+            cmbWinPos.SelectedIndex = Math.Max(0, Array.IndexOf(PosKeys, cfg.VoicePos));
+            int ri = 2; double bd = 9;
+            for (int k = 0; k < Rates.Length; k++) { double d = Math.Abs(Rates[k] - cfg.VoiceRate); if (d < bd) { bd = d; ri = k; } }
+            cmbRate.SelectedIndex = ri;
+            fldName.Box.Text = cfg.UserName ?? "";
+            fldHotkey.Box.Text = cfg.VoiceHotkey ?? "";
+            loading = false;
+            FitContent();
+        }
+
+        void Save()
+        {
+            if (loading) return;
+            cfg = Config.Load();
+            cfg.VoiceEnabled = tglVoice.Checked;
+            cfg.VoiceRepeats = (int)numRepeats.Value;
+            cfg.VoiceIdleSeconds = (int)numIdle.Value;
+            cfg.VoiceListen = tglListen.Checked;
+            cfg.VoiceShowWindow = tglShowWin.Checked;
+            cfg.VoiceNatural = tglNatural.Checked;
+            cfg.VoiceAnnounce = tglAnnounce.Checked;
+            cfg.VoiceNikud = tglNikud.Checked;
+            cfg.VoiceDictate = tglDictate.Checked;
+            cfg.VoiceNeedSend = tglNeedSend.Checked;
+            cfg.VoiceLowMem = tglLowMem.Checked;
+            cfg.VoiceGender = cmbGender.SelectedIndex == 1 ? "female" : "male";
+            cfg.VoiceLang = cmbVLang.SelectedIndex == 1 ? "he" : (cmbVLang.SelectedIndex == 2 ? "en" : "auto");
+            cfg.VoicePos = PosKeys[Math.Max(0, cmbWinPos.SelectedIndex)];
+            cfg.VoiceRate = Rates[Math.Max(0, cmbRate.SelectedIndex)];
+            cfg.UserName = fldName.Box.Text.Trim();
+            cfg.VoiceHotkey = fldHotkey.Box.Text.Trim();
+            cfg.Save();
             ctx.ConfigChanged(cfg);
         }
     }

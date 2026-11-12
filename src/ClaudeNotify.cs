@@ -39,6 +39,11 @@ namespace ClaudeNotify
             bool runSchedule = a0 == "--run-schedule";
             if (a0 == "--uninstall") { HookInstaller.Remove(); return; }
 
+            // קריסות: רושמים ללוג את השגיאה המלאה
+            AppDomain.CurrentDomain.UnhandledException += delegate(object s, UnhandledExceptionEventArgs e) { Log.Write("CRASH (unhandled): " + e.ExceptionObject); };
+            Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
+            Application.ThreadException += delegate(object s, ThreadExceptionEventArgs e) { Log.Write("ERROR (ui thread): " + e.Exception); };
+
             L.Load(Config.Load().Language);
             bool created;
             using (var m = new Mutex(true, "Local\\ClaudeNotifyTray", out created))
@@ -323,9 +328,27 @@ namespace ClaudeNotify
         public bool UseCustomPopup { get; set; }
         public bool PopupLeft { get; set; }   // false = פינה ימנית תחתונה, true = שמאלית תחתונה
         public string Language { get; set; }  // "he" או "en"
+        public bool VoiceEnabled { get; set; }   // קריאה בקול כשהמשתמש לא ליד המחשב
+        public string UserName { get; set; }     // השם שבו קוראים למשתמש (מוזן על ידו)
+        public string VoiceHotkey { get; set; }  // למשל Ctrl+Alt+V
+        public int VoiceRepeats { get; set; }    // כמה פעמים לקרוא
+        public bool VoiceShowWindow { get; set; } // להציג את חלון ההאזנה (ומה שנשמע) או להסתיר
+        public int VoiceIdleSeconds { get; set; } // קורא רק אם לא נגעתי במחשב כל כך הרבה שניות (0 = תמיד)
+        public string VoicePos { get; set; }     // מיקום חלון ההאזנה: br, bl, tr, tl, center
+        public string VoiceLang { get; set; }    // שפת הדיבור: auto = לפי שפת הממשק, he, en
+        public string VoiceGender { get; set; }  // "male" או "female"
+        public double VoiceRate { get; set; }    // 1.0 = רגיל
+        public bool VoiceAnnounce { get; set; }  // להודיע בקול על הפעלה וכיבוי של הקריאה
+        public bool VoiceDictate { get; set; }   // הכתבה ל-Claude אחרי שאמרתי שאני מגיע
+        public bool VoiceNeedSend { get; set; }  // לשלוח רק אחרי שאמרתי "שלח"
+        public bool VoiceLowMem { get; set; }    // לסגור את הדף כשהקריאה כבויה
+        public bool VoiceNikud { get; set; }     // ניקוד אוטומטי של הטקסט לפני הקראה (דרך Claude)
+        public bool VoiceNatural { get; set; }   // קול טבעי של Edge (דורש אינטרנט)
+        public bool VoiceListen { get; set; }    // האזנה לתשובה בקול
 
         public Config()
         {
+            VoiceEnabled = false; UserName = ""; VoiceRepeats = 3; VoiceListen = true; VoiceNatural = true; VoiceGender = "male"; VoiceLang = "auto"; VoicePos = "br"; VoiceIdleSeconds = 60; VoiceRate = 1.0; VoiceAnnounce = true; VoiceNikud = true; VoiceDictate = false; VoiceNeedSend = true; VoiceLowMem = false; VoiceHotkey = "Ctrl+Alt+V";
             DisplaySeconds = 8; UseCustomPopup = true; Language = "he";
             Enabled = true; Summarize = true; MaxWords = 30; SkipWhenVisible = true;
             Processes = "Code, Code - Insiders, Cursor";
@@ -350,6 +373,12 @@ namespace ClaudeNotify
                         if (c.DisplaySeconds < 2 || c.DisplaySeconds > 60) c.DisplaySeconds = 8;
                         if (string.IsNullOrEmpty(c.Processes)) c.Processes = "Code, Code - Insiders, Cursor";
                         if (c.Language != "en") c.Language = "he";
+                        if (c.VoiceRepeats < 1 || c.VoiceRepeats > 10) c.VoiceRepeats = 3;
+                        if (c.VoiceGender != "female") c.VoiceGender = "male";
+                        if (c.VoiceLang != "he" && c.VoiceLang != "en") c.VoiceLang = "auto";
+                        if (c.VoicePos != "bl" && c.VoicePos != "tr" && c.VoicePos != "tl" && c.VoicePos != "center") c.VoicePos = "br";
+                        if (c.VoiceIdleSeconds < 0 || c.VoiceIdleSeconds > 600) c.VoiceIdleSeconds = 60;
+                        if (c.VoiceRate < 0.5 || c.VoiceRate > 2.0) c.VoiceRate = 1.0;
                         return c;
                     }
                 }
@@ -373,6 +402,772 @@ namespace ClaudeNotify
                 if (t.Length > 0) l.Add(t);
             }
             return l.ToArray();
+        }
+    }
+
+    // חלון נסתר שמאזין לקיצור המקשים הגלובלי
+    class HotkeyForm : Form
+    {
+        const int WM_HOTKEY = 0x0312, Id = 0xC1A1;
+        public event Action Pressed;
+
+        [System.Runtime.InteropServices.DllImport("user32.dll")] static extern bool RegisterHotKey(IntPtr h, int id, uint mod, uint vk);
+        [System.Runtime.InteropServices.DllImport("user32.dll")] static extern bool UnregisterHotKey(IntPtr h, int id);
+
+        public static bool TryParse(string s, out uint mod, out uint vk)
+        {
+            mod = 0; vk = 0;
+            if (string.IsNullOrEmpty(s)) return false;
+            foreach (var part in s.Split('+'))
+            {
+                string p = part.Trim();
+                if (p.Equals("Ctrl", StringComparison.OrdinalIgnoreCase)) mod |= 2;
+                else if (p.Equals("Alt", StringComparison.OrdinalIgnoreCase)) mod |= 1;
+                else if (p.Equals("Shift", StringComparison.OrdinalIgnoreCase)) mod |= 4;
+                else if (p.Equals("Win", StringComparison.OrdinalIgnoreCase)) mod |= 8;
+                else
+                {
+                    try { vk = (uint)(Keys)Enum.Parse(typeof(Keys), p, true); } catch { return false; }
+                }
+            }
+            return vk != 0 && mod != 0;
+        }
+
+        public bool Register(string hotkey)
+        {
+            UnregisterHotKey(Handle, Id);
+            uint mod, vk;
+            if (!TryParse(hotkey, out mod, out vk)) return false;
+            return RegisterHotKey(Handle, Id, mod | 0x4000, vk);
+        }
+
+        protected override void WndProc(ref Message m)
+        {
+            if (m.Msg == WM_HOTKEY && m.WParam.ToInt32() == Id && Pressed != null) Pressed();
+            base.WndProc(ref m);
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing && IsHandleCreated) UnregisterHotKey(Handle, Id);
+            base.Dispose(disposing);
+        }
+    }
+
+    // מריץ סקריפט PowerShell מקובץ זמני. בלי -EncodedCommand: דפוס שאנטי-וירוס חוסם כי תוכנות זדוניות משתמשות בו
+    static class PsFile
+    {
+        public static Process Start(string script, bool redirectOutput)
+        {
+            string dir = Path.Combine(Config.Dir, "tmp");
+            Directory.CreateDirectory(dir);
+            try { foreach (var old in Directory.GetFiles(dir, "*.ps1")) if (File.GetLastWriteTime(old) < DateTime.Now.AddHours(-1)) File.Delete(old); } catch { }
+            string path = Path.Combine(dir, Guid.NewGuid().ToString("N") + ".ps1");
+            File.WriteAllText(path, script, new UTF8Encoding(true)); // BOM: כדי ש-PowerShell 5.1 יקרא עברית נכון
+            var psi = new ProcessStartInfo("powershell", "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"" + path + "\"");
+            psi.UseShellExecute = false;
+            psi.CreateNoWindow = true;
+            if (redirectOutput) { psi.RedirectStandardOutput = true; psi.RedirectStandardError = true; }
+            var p = Process.Start(psi);
+            p.EnableRaisingEvents = true;
+            p.Exited += delegate { try { File.Delete(path); } catch { } };
+            return p;
+        }
+    }
+
+    // דף דפדפן שנשאר פתוח ברקע (מוסתר) ומשמש גם להקראה בקול טבעי של Edge וגם להאזנה (זיהוי דיבור).
+    // כך ההקראה מוכנה מיד, והמיקרופון נדלק רק כשצריך להאזין
+    class VoiceListener
+    {
+        const int Port = 47653;
+        const string Page = @"<!doctype html><html><head><meta charset=""utf-8""><title>@TITLE@</title><link rel=""icon"" type=""image/png"" sizes=""256x256"" href=""/icon.png""><link rel=""icon"" href=""/favicon.ico"">
+<meta name=""theme-color"" content=""#FAF9F5"">
+<style>
+*{box-sizing:border-box}
+body{margin:0;padding:12px;min-height:100vh;overflow:hidden;display:flex;align-items:center;background:#FAF9F5;color:#3D3929;font-family:Segoe UI,sans-serif;direction:@DIR@}
+.card{width:100%;background:#fff;border:1px solid #EBE5D9;border-radius:12px;padding:14px 16px;display:flex;align-items:center;gap:14px;box-shadow:0 1px 4px rgba(61,57,41,.08)}
+.card img{width:46px;height:46px;border-radius:10px;flex:none}
+.main{flex:1;min-width:0}
+.row{display:flex;align-items:center;gap:8px;font-size:17px;font-weight:600}
+.sub{font-size:12px;color:#837D6E;margin-top:2px}
+.dot{width:10px;height:10px;border-radius:50%;background:#837D6E;flex:none}
+.dot.ready{background:#D97757}.dot.err{background:#B33A3A}
+.dot.listen{background:#467D55;animation:p 1.3s infinite}
+@keyframes p{0%{box-shadow:0 0 0 0 rgba(70,125,85,.5)}100%{box-shadow:0 0 0 8px rgba(70,125,85,0)}}
+#t{margin-top:10px;background:#FCF1EB;border-radius:8px;padding:6px 10px;color:#C15F3C;font-size:14px;word-break:break-word;max-height:5.6em;overflow:hidden}
+#t.ph{background:transparent;border:1px dashed #D9D2C2;color:#837D6E;font-size:13px}
+#t:empty{display:none}
+</style></head><body>
+<div class=""card""><img src=""/icon.png"" alt="""">
+<div class=""main""><div class=""row""><span id=""d"" class=""dot""></span><span id=""s"">@S_START@</span></div><div class=""sub"">Claude Notify</div><div id=""t""></div></div></div>
+<script>
+var q=new URLSearchParams(location.search);
+var rate=parseFloat(q.get('rate')||'1')||1,gender=q.get('gender')||'male',lang=q.get('lang')||'he-IL',pre=lang.substring(0,2);
+var S=document.getElementById('s'),T=document.getElementById('t'),D=document.getElementById('d');
+var HINT='@S_HINT@',delay=300;
+function tail(t){t=t.trim();return t.length>80?'…'+t.slice(-80):t;}
+function st(t,c){S.textContent=t;D.className='dot '+c;post('/status',c+'|'+t);
+ if(c=='listen'){if(!T.textContent){T.className='ph';T.textContent=HINT;}}
+ else if(T.className=='ph'){T.className='';T.textContent='';}}
+function post(u,b){try{fetch(u,{method:'POST',body:b||''});}catch(e){}}
+function postHeard(t){try{fetch('/heard',{method:'POST',body:t}).then(function(r){return r.text();}).then(function(x){if(x=='ok'){T.className='';T.textContent=tail(t);}});}catch(e){}}
+var voice=null,reported=false;
+function pick(){var all=speechSynthesis.getVoices().filter(function(v){return v.lang.replace('_','-').indexOf(pre)==0;});
+ var vs=all.filter(function(v){return /Natural|Online/i.test(v.name);});
+ var want=gender=='female'?/הילה|Hila|Jenny|Aria|Emma|Ava/i:/אברי|Avri|Guy|Davis|Andrew|Brian/i;
+ for(var i=0;i<vs.length;i++)if(want.test(vs[i].name))return vs[i];
+ if(vs.length)return vs[0];
+ var g=all.filter(function(v){return /Google/i.test(v.name);});
+ return g.length?g[0]:null;}
+function report(){if(reported||speechSynthesis.getVoices().length==0)return;reported=true;voice=pick();
+ post('/tts',voice?voice.name:'');post('/log','voices: '+speechSynthesis.getVoices().filter(function(x){return x.lang.indexOf(pre)==0;}).map(function(x){return x.name+'('+x.lang+')';}).join('; '));st('@S_READY@','ready');}
+speechSynthesis.onvoiceschanged=report;report();
+setTimeout(function(){if(!reported){reported=true;voice=pick();post('/tts',voice?voice.name:'');st('@S_READY@','ready');}},3000);
+var R=window.SpeechRecognition||window.webkitSpeechRecognition,rec=null,listening=false;
+function startRec(){
+ if(!R){post('/error','unsupported');return;}
+ if(rec)return;listening=true;
+ var me=new R();rec=me;me.lang=lang;me.continuous=true;me.interimResults=true;
+ me.onstart=function(){st('@S_LISTEN@','listen');post('/ready');};
+ me.onresult=function(e){var t='';for(var i=e.resultIndex;i<e.results.length;i++){var tr=e.results[i][0].transcript;t+=tr+' ';if(e.results[i].isFinal)post('/final',tr);}delay=300;postHeard(t);};
+ ['audiostart','soundstart','speechstart','nomatch'].forEach(function(n){me['on'+n]=function(){post('/log',n);};});
+ me.onerror=function(e){if(e.error=='no-speech'||e.error=='aborted')return;if(e.error=='network'){delay=2500;st('@S_NET@','err');}else st('@S_ERR@'+e.error,'err');post('/error',e.error);};
+ me.onend=function(){if(listening&&rec===me)setTimeout(function(){try{if(listening&&rec===me)me.start();}catch(e){}},delay);};
+ try{me.start();}catch(e){post('/error',String(e));}
+}
+function stopRec(){listening=false;var r=rec;rec=null;if(r){try{r.stop();}catch(e){}}st('@S_READY@','ready');T.className='';T.textContent='';}
+function speak(t){
+ if(!voice){post('/spoke');return;}
+ var go=function(){
+  var u=new SpeechSynthesisUtterance(t);u.voice=voice;u.lang=voice.lang;u.rate=rate;
+  u.onend=function(){post('/spoke');};
+  u.onerror=function(e){if(e.error=='canceled'||e.error=='interrupted')return;post('/log','tts error '+e.error);post('/spoke');};
+  speechSynthesis.speak(u);
+ };
+ if(speechSynthesis.speaking||speechSynthesis.pending){speechSynthesis.cancel();setTimeout(go,200);}else go();
+}
+setInterval(function(){
+ fetch('/poll',{method:'POST'}).then(function(r){return r.text();}).then(function(t){
+  if(!t)return;var c=t.charAt(0),a=t.substring(1);
+  if(c=='L'){if(a=='1')startRec();else stopRec();}
+  else if(c=='C'){if(speechSynthesis.speaking||speechSynthesis.pending)speechSynthesis.cancel();stopRec();}
+  else if(c=='S')speak(a);
+ }).catch(function(){});},200);
+</script></body></html>";
+
+        readonly object gate = new object();
+        readonly List<KeyValuePair<DateTime, string>> heard = new List<KeyValuePair<DateTime, string>>();
+        readonly List<KeyValuePair<DateTime, string>> finals = new List<KeyValuePair<DateTime, string>>();
+        readonly Queue<string> cmds = new Queue<string>();
+        readonly ManualResetEvent spokeEv = new ManualResetEvent(false);
+        System.Net.HttpListener http;
+        Process browser;
+        IntPtr hwnd = IntPtr.Zero;
+        volatile bool ready;
+        volatile bool speaking;
+        volatile bool ttsReported;
+        DateTime mutedUntil = DateTime.MinValue;
+        static bool staleKilled;
+
+        // הדף עם הטקסטים בשפת הממשק
+        static string PageHtml()
+        {
+            return Page.Replace("@TITLE@", L.T("Claude Notify - מאזין", "Claude Notify - Listening"))
+                       .Replace("@DIR@", L.He ? "rtl" : "ltr")
+                       .Replace("@S_START@", L.T("מתחיל...", "Starting..."))
+                       .Replace("@S_READY@", L.T("מוכן", "Ready"))
+                       .Replace("@S_LISTEN@", L.T("מאזין... אפשר לדבר", "Listening... you can speak"))
+                       .Replace("@S_ERR@", L.T("שגיאה: ", "Error: "))
+                       .Replace("@S_NET@", L.T("אין חיבור לשירות הזיהוי, מנסה שוב...", "No connection to the recognition service, retrying..."))
+                       .Replace("@S_HINT@", L.T("אומרים משהו, והטקסט יופיע כאן", "Say something and the text will appear here"));
+        }
+        public DateTime StartedAt = DateTime.Now;
+        public event Action<string, string> StatusChanged;   // מצב (ready/listen/err), טקסט
+        public event Action<string> HeardChanged;            // מה שנשמע עכשיו
+        public string NaturalVoice = "";
+        public string Error;
+        public bool Ready { get { return ready; } }
+        public bool TtsReported { get { return ttsReported; } }
+        public bool NaturalOk { get { return ttsReported && !string.IsNullOrEmpty(NaturalVoice); } }
+        public bool IsAlive { get { return http != null && browser != null && !browser.HasExited; } }
+
+        // שולח טקסט לדף להקראה בקול טבעי, וממתין לסיום
+        public bool Speak(string text)
+        {
+            spokeEv.Reset();
+            Enqueue("S" + text);
+            return spokeEv.WaitOne(60000);
+        }
+
+        void Enqueue(string c) { lock (gate) cmds.Enqueue(c); }
+
+        // מדליק מיקרופון והאזנה, וממתין שהדף יתחיל להאזין. אם צריך לאשר מיקרופון - מראה את החלון
+        public bool StartListen()
+        {
+            lock (gate) { heard.Clear(); finals.Clear(); }
+            ready = false;
+            Enqueue("L1");
+            for (int i = 0; i < 30 && !ready; i++) Thread.Sleep(200);
+            if (!ready)
+            {
+                Reveal(true);
+                for (int i = 0; i < 70 && !ready; i++) Thread.Sleep(200);
+                Reveal(false);
+            }
+            return ready;
+        }
+
+        public void StopListen() { Enqueue("L0"); ready = false; }
+
+        // עוצר הקראה והאזנה מיד
+        public void Abort()
+        {
+            lock (gate) { cmds.Clear(); cmds.Enqueue("C"); }
+            ready = false;
+            spokeEv.Set();
+        }
+
+        // בזמן שהתוכנה מדברת (ומעט אחרי) המיקרופון קולט את הרמקולים, ולכן מתעלמים ממה שנשמע
+        public void SetSpeaking(bool on)
+        {
+            speaking = on;
+            if (!on) mutedUntil = DateTime.Now.AddMilliseconds(1500);
+        }
+        bool IsMuted { get { return speaking || DateTime.Now < mutedUntil; } }
+
+        public static string FindBrowser()
+        {
+            string[] c = {
+                @"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+                @"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+                @"C:\Program Files\Google\Chrome\Application\chrome.exe",
+                @"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), @"Google\Chrome\Application\chrome.exe") };
+            foreach (var p in c) if (File.Exists(p)) return p;
+            return null;
+        }
+
+        // אם התוכנה נסגרה בכוח, נשאר דפדפן יתום עם הפרופיל שלנו, וחלון חדש היה נפתח בתוכו. סוגרים אותו
+        static void KillStale()
+        {
+            if (staleKilled) return;
+            staleKilled = true;
+            try
+            {
+                using (var s = new System.Management.ManagementObjectSearcher("SELECT ProcessId, CommandLine FROM Win32_Process WHERE Name='msedge.exe' OR Name='chrome.exe'"))
+                    foreach (System.Management.ManagementObject o in s.Get())
+                    {
+                        string cl = o["CommandLine"] as string;
+                        if (cl != null && cl.IndexOf(@"ClaudeNotify\browser", StringComparison.OrdinalIgnoreCase) >= 0)
+                            try { Process.GetProcessById(Convert.ToInt32(o["ProcessId"])).Kill(); } catch { }
+                    }
+            }
+            catch (Exception ex) { Log.Write("kill stale: " + ex.Message); }
+        }
+
+        public bool Start(string lang, string gender, double rate)
+        {
+            string exe = FindBrowser();
+            if (exe == null) { Error = "no Chrome/Edge found"; return false; }
+            try
+            {
+                KillStale();
+                http = new System.Net.HttpListener();
+                http.Prefixes.Add("http://127.0.0.1:" + Port + "/");
+                http.Start();
+                var t = new Thread(Serve); t.IsBackground = true; t.Start();
+                // פרופיל נפרד: ההרשאה למיקרופון נשמרת בו, והתהליך שלנו וקל לסגור
+                string prof = Path.Combine(Config.Dir, "browser");
+                Directory.CreateDirectory(Path.Combine(prof, "Default"));
+                // מאשרים מראש גישה למיקרופון לכתובת המקומית שלנו בלבד (בפרופיל הנפרד), כדי שלא תקפוץ בקשה
+                string prefs = Path.Combine(prof, @"Default\Preferences");
+                if (!File.Exists(prefs))
+                    File.WriteAllText(prefs, "{\"profile\":{\"content_settings\":{\"exceptions\":{\"media_stream_mic\":{\"http://127.0.0.1:" + Port + ",*\":{\"setting\":1}}}}}}", new UTF8Encoding(false));
+                var psi = new ProcessStartInfo(exe,
+                    "--user-data-dir=\"" + prof + "\" --app=http://127.0.0.1:" + Port + "/?gender=" + gender + "&rate=" + rate.ToString(System.Globalization.CultureInfo.InvariantCulture) + "&lang=" + lang +
+                    " --autoplay-policy=no-user-gesture-required --window-size=380,220 --no-first-run --no-default-browser-check --disable-features=CalculateNativeWinOcclusion,Translate,OptimizationHints,MediaRouter --disable-backgrounding-occluded-windows --disable-renderer-backgrounding --disable-gpu --disable-extensions --disable-background-networking --disable-sync --disable-component-update --renderer-process-limit=1");
+                psi.UseShellExecute = false;
+                browser = Process.Start(psi);
+                StartedAt = DateTime.Now;
+                var trimmer = new Thread(TrimLoop); trimmer.IsBackground = true; trimmer.Start();
+                var hider = new Thread(HideWindow); hider.IsBackground = true; hider.Start();
+                return true;
+            }
+            catch (Exception ex) { Error = ex.Message; Stop(); return false; }
+        }
+
+        [DllImport("user32.dll")] static extern bool SetWindowPos(IntPtr h, IntPtr after, int x, int y, int cx, int cy, uint flags);
+        [DllImport("user32.dll")] static extern int GetWindowLong(IntPtr h, int i);
+        [DllImport("user32.dll")] static extern int SetWindowLong(IntPtr h, int i, int v);
+
+        [DllImport("user32.dll")] static extern IntPtr SendMessage(IntPtr h, int msg, IntPtr w, IntPtr l);
+        Icon bigIcon, smallIcon;
+
+        // מגדיר לחלון הדפדפן את אייקון התוכנה (חד, בגודל המתאים למסך), במקום האייקון הקטן והמטושטש שהדפדפן לוקח מהדף
+        void SetIcons(IntPtr h)
+        {
+            try
+            {
+                if (bigIcon == null)
+                {
+                    bigIcon = new Icon(Branding.AppIcon, SystemInformation.IconSize);
+                    smallIcon = new Icon(Branding.AppIcon, SystemInformation.SmallIconSize);
+                }
+                SendMessage(h, 0x0080, new IntPtr(1), bigIcon.Handle);       // WM_SETICON, ICON_BIG
+                SendMessage(h, 0x0080, IntPtr.Zero, smallIcon.Handle);       // ICON_SMALL
+            }
+            catch { }
+        }
+
+        // מוצא את חלון הדפדפן, מגדיר לו את האייקון שלנו, ואם צריך - מזיז אותו אל מחוץ למסך (ומוריד מסרגל המשימות)
+        void HideWindow()
+        {
+            try
+            {
+                var b = browser;
+                IntPtr h = IntPtr.Zero;
+                for (int i = 0; i < 100 && h == IntPtr.Zero && b != null && !b.HasExited; i++)
+                {
+                    Thread.Sleep(100); b.Refresh(); h = b.MainWindowHandle;
+                }
+                if (h == IntPtr.Zero) return;
+                SetIcons(h);
+                SetWindowLong(h, -20, (GetWindowLong(h, -20) | 0x80) & ~0x40000); // TOOLWINDOW, לא APPWINDOW
+                hwnd = h;
+                Reveal(false);
+                // הדפדפן עשוי להחליף את האייקון אחרי שהדף נטען - מגדירים שוב
+                for (int k = 0; k < 3; k++) { Thread.Sleep(3000); if (b == null || b.HasExited) return; SetIcons(h); }
+            }
+            catch { }
+        }
+
+        // מראה את החלון (כדי לאשר מיקרופון) או מחביא אותו מחוץ למסך
+        void Reveal(bool show)
+        {
+            var h = hwnd;
+            if (h == IntPtr.Zero) return;
+            if (show) SetWindowPos(h, new IntPtr(-1), 200, 200, 0, 0, 0x0001 | 0x0010);   // TOPMOST, NOSIZE|NOACTIVATE
+            else SetWindowPos(h, IntPtr.Zero, -32000, -32000, 0, 0, 0x0001 | 0x0004 | 0x0010);
+        }
+
+        [DllImport("psapi.dll")] static extern bool EmptyWorkingSet(IntPtr h);
+        [DllImport("kernel32.dll")] static extern IntPtr OpenProcess(uint access, bool inherit, int pid);
+        [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr h);
+
+        // כל כמה דקות, כשהדף במנוחה, מחזירים ל-Windows את הזיכרון שהדפדפן לא משתמש בו כרגע. הוא נטען חזרה לפי הצורך
+        void TrimLoop()
+        {
+            Thread.Sleep(15000);
+            while (http != null)
+            {
+                try { if (!speaking && !ready) TrimMemory(); } catch { }
+                for (int i = 0; i < 120 && http != null; i++) Thread.Sleep(1000);
+            }
+        }
+
+        static void TrimMemory()
+        {
+            using (var q = new System.Management.ManagementObjectSearcher("SELECT ProcessId, CommandLine FROM Win32_Process WHERE Name='msedge.exe' OR Name='chrome.exe'"))
+                foreach (System.Management.ManagementObject o in q.Get())
+                {
+                    string cl = o["CommandLine"] as string;
+                    if (cl == null || cl.IndexOf(@"ClaudeNotify\browser", StringComparison.OrdinalIgnoreCase) < 0) continue;
+                    IntPtr h = OpenProcess(0x0100 | 0x0400, false, Convert.ToInt32(o["ProcessId"])); // SET_QUOTA | QUERY_INFORMATION
+                    if (h != IntPtr.Zero) { EmptyWorkingSet(h); CloseHandle(h); }
+                }
+        }
+
+        void Serve()
+        {
+            while (http != null && http.IsListening)
+            {
+                System.Net.HttpListenerContext cx;
+                try { cx = http.GetContext(); } catch { return; }
+                try
+                {
+                    string path = cx.Request.Url.AbsolutePath;
+                    if (path == "/favicon.ico")
+                    {
+                        var ms = new MemoryStream();
+                        Branding.WriteIco(ms, new[] { 16, 24, 32, 48, 64, 128, 256 });
+                        var ib = ms.ToArray();
+                        cx.Response.ContentType = "image/x-icon";
+                        cx.Response.OutputStream.Write(ib, 0, ib.Length);
+                    }
+                    else if (path == "/icon.png")
+                    {
+                        var ms = new MemoryStream();
+                        using (var bmp = Branding.MakeBitmap(256)) bmp.Save(ms, System.Drawing.Imaging.ImageFormat.Png);
+                        var pb = ms.ToArray();
+                        cx.Response.ContentType = "image/png";
+                        cx.Response.OutputStream.Write(pb, 0, pb.Length);
+                    }
+                    else if (path == "/")
+                    {
+                        var b = Encoding.UTF8.GetBytes(PageHtml());
+                        cx.Response.ContentType = "text/html; charset=utf-8";
+                        cx.Response.OutputStream.Write(b, 0, b.Length);
+                    }
+                    else
+                    {
+                        string body = "", resp = "ok";
+                        using (var sr = new StreamReader(cx.Request.InputStream, Encoding.UTF8)) body = sr.ReadToEnd();
+                        if (path == "/ready") ready = true;
+                        else if (path == "/error") { Error = body; Log.Write("voice listen error: " + body); }
+                        else if (path == "/tts") { NaturalVoice = body; ttsReported = true; Log.Write("voice: natural voice [" + body + "]"); }
+                        else if (path == "/final") { if (!IsMuted) lock (gate) finals.Add(new KeyValuePair<DateTime, string>(DateTime.Now, body)); }
+                        else if (path == "/poll") { lock (gate) resp = cmds.Count > 0 ? cmds.Dequeue() : ""; }
+                        else if (path == "/spoke") spokeEv.Set();
+                        else if (path == "/status")
+                        {
+                            int bar = body.IndexOf('|');
+                            var ev = StatusChanged;
+                            if (bar > 0 && ev != null) ev(body.Substring(0, bar), body.Substring(bar + 1));
+                        }
+                        else if (path == "/log") Log.Write("voice page: " + body);
+                        else if (path == "/heard")
+                        {
+                            if (IsMuted) resp = "mute";
+                            else
+                            {
+                                lock (gate) heard.Add(new KeyValuePair<DateTime, string>(DateTime.Now, body));
+                                var hv = HeardChanged;
+                                if (hv != null) hv(body);
+                            }
+                        }
+                        var rb = Encoding.UTF8.GetBytes(resp);
+                        cx.Response.OutputStream.Write(rb, 0, rb.Length);
+                    }
+                    cx.Response.Close();
+                }
+                catch { }
+            }
+        }
+
+        // כל מה שנשמע מאז הזמן הנתון
+        public string HeardSince(DateTime t)
+        {
+            var sb = new StringBuilder();
+            lock (gate) foreach (var h in heard) if (h.Key >= t) sb.Append(h.Value).Append(' ');
+            return sb.ToString();
+        }
+
+        // משפטים סופיים בלבד (בלי הגרסאות החלקיות שמתעדכנות תוך כדי דיבור)
+        public string FinalsSince(DateTime t)
+        {
+            var sb = new StringBuilder();
+            lock (gate) foreach (var h in finals) if (h.Key >= t) sb.Append(h.Value.Trim()).Append(' ');
+            return sb.ToString().Trim();
+        }
+
+        // הטקסט החלקי האחרון (אם עוד לא התקבל משפט סופי)
+        public string LastSince(DateTime t)
+        {
+            string last = "";
+            lock (gate) foreach (var h in heard) if (h.Key >= t) last = h.Value;
+            return last.Trim();
+        }
+
+        public void Stop()
+        {
+            spokeEv.Set();
+            try { if (http != null) http.Close(); } catch { }
+            http = null;
+            try
+            {
+                if (browser != null && !browser.HasExited)
+                {
+                    var k = Process.Start(new ProcessStartInfo("taskkill", "/PID " + browser.Id + " /T /F") { CreateNoWindow = true, UseShellExecute = false });
+                    k.WaitForExit(3000);
+                }
+            }
+            catch { }
+            browser = null;
+        }
+    }
+
+    // הקראה בקול טבעי של Edge (או בקול של Windows דרך PowerShell כגיבוי), והאזנה לתשובה דרך הדפדפן
+    static class Voice
+    {
+        // שפת הדיבור (הקראה, האזנה, סיכום): לפי ההגדרה, או לפי שפת הממשק
+        public static bool IsHe { get { string v = Config.Load().VoiceLang; return v == "he" || (v != "en" && L.He); } }
+        public static string T(string he, string en) { return IsHe ? he : en; }
+
+        [StructLayout(LayoutKind.Sequential)] struct LASTINPUTINFO { public uint cbSize; public uint dwTime; }
+        [DllImport("user32.dll")] static extern bool GetLastInputInfo(ref LASTINPUTINFO info);
+
+        // כמה שניות עברו מאז שהמשתמש נגע במקלדת או בעכבר
+        public static double IdleSeconds()
+        {
+            var li = new LASTINPUTINFO(); li.cbSize = (uint)Marshal.SizeOf(typeof(LASTINPUTINFO));
+            if (!GetLastInputInfo(ref li)) return 9999;
+            return (uint)(Environment.TickCount - (int)li.dwTime) / 1000.0;
+        }
+
+        // האם המשתמש נגע במחשב אחרי הרגע הנתון
+        static bool UserActiveSince(DateTime t)
+        {
+            return IdleSeconds() < (DateTime.Now - t).TotalSeconds - 1.0;
+        }
+
+        public static Control Ui;   // לחלון הראשי, כדי לפתוח חלונות משרשורי רקע
+        static ListenForm lf;
+
+        static void ShowListen(VoiceListener l)
+        {
+            var ui = Ui;
+            if (ui == null || !Config.Load().VoiceShowWindow) return;
+            ui.BeginInvoke(new Action(delegate
+            {
+                if (lf == null || lf.IsDisposed) lf = new ListenForm();
+                lf.Attach(l);
+                lf.Show();
+            }));
+        }
+
+        static void HideListen()
+        {
+            var ui = Ui;
+            if (ui == null) return;
+            ui.BeginInvoke(new Action(delegate { if (lf != null && !lf.IsDisposed) { lf.Detach(); lf.Hide(); } }));
+        }
+
+        // החלפת שפה: החלון ייבנה מחדש בשפה החדשה
+        public static void ResetListenWindow()
+        {
+            var ui = Ui;
+            if (ui == null) return;
+            ui.BeginInvoke(new Action(delegate { if (lf != null) { lf.Dispose(); lf = null; } }));
+        }
+
+        static Process current;
+        static volatile int generation;
+        static VoiceListener host;
+        static string hostKey = "";
+        static readonly object hostLock = new object();
+
+        const string Ps = @"
+$ErrorActionPreference = 'SilentlyContinue'
+$text = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('@TEXT@'))
+[void][Windows.Media.SpeechSynthesis.SpeechSynthesizer, Windows.Media.SpeechSynthesis, ContentType=WindowsRuntime]
+Add-Type -AssemblyName System.Runtime.WindowsRuntime
+$asTask = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {
+    $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and
+    $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1' })[0]
+$synth = New-Object Windows.Media.SpeechSynthesis.SpeechSynthesizer
+$synth.Options.SpeakingRate = @RATE@
+$v = [Windows.Media.SpeechSynthesis.SpeechSynthesizer]::AllVoices | Where-Object { $_.Language -like '@LANG@*' } | Select-Object -First 1
+if ($v) { $synth.Voice = $v }
+$k = $asTask.MakeGenericMethod([Windows.Media.SpeechSynthesis.SpeechSynthesisStream]).Invoke($null, @($synth.SynthesizeTextToStreamAsync($text)))
+[void]$k.Wait(-1)
+$wav = Join-Path $env:TEMP ('claude-speak-' + [guid]::NewGuid().ToString('N') + '.wav')
+$in = [System.IO.WindowsRuntimeStreamExtensions]::AsStreamForRead($k.Result)
+$out = [System.IO.File]::Create($wav)
+$in.CopyTo($out); $out.Close(); $in.Close()
+$player = New-Object System.Media.SoundPlayer $wav
+$player.PlaySync()
+Remove-Item $wav -Force
+";
+
+        // מילים שמסמנות "שמעתי, אני בדרך" - ההקראה נעצרת כשנשמעת אחת מהן
+        static readonly string[] AckWords = { "מגיע", "שנייה", "שניה", "רגע", "שומע", "שמעתי", "הנה", "אני כאן", "בסדר", "אוקיי", "אוקי", "טוב", "די", "מספיק", "עוצר", "coming", "second", "wait", "okay", "ok" };
+
+        public static bool IsAck(string heard)
+        {
+            if (string.IsNullOrEmpty(heard)) return false;
+            string h = heard.ToLowerInvariant();
+            foreach (var w in AckWords) if (h.IndexOf(w, StringComparison.Ordinal) >= 0) return true;
+            return false;
+        }
+
+        // מחזיר את הדף החם (ויוצר אותו אם צריך). קוראים לזה משרשור רקע: היצירה הראשונה לוקחת כמה שניות
+        static VoiceListener GetHost()
+        {
+            lock (hostLock)
+            {
+                var c = Config.Load();
+                string lang = IsHe ? "he-IL" : "en-US";
+                string key = lang + "|" + c.VoiceGender + "|" + c.VoiceRate.ToString(System.Globalization.CultureInfo.InvariantCulture) + "|" + c.VoiceShowWindow;
+                // אם הקול הטבעי לא נמצא (למשל כי לא היה אינטרנט) - מנסים שוב בעוד דקה
+                bool stale = host != null && host.TtsReported && !host.NaturalOk && (DateTime.Now - host.StartedAt).TotalSeconds > 60;
+                if (host != null && (!host.IsAlive || hostKey != key || stale)) { host.Stop(); host = null; }
+                if (host == null)
+                {
+                    var h = new VoiceListener();
+                    if (!h.Start(lang, c.VoiceGender, c.VoiceRate)) { Log.Write("voice: browser failed: " + h.Error); return null; }
+                    host = h; hostKey = key;
+                }
+                for (int i = 0; i < 100 && !host.TtsReported && host.IsAlive; i++) Thread.Sleep(200);
+                return host;
+            }
+        }
+
+        // מחמם את הדף ברקע, כדי שההקראה תהיה מיידית
+        public static void Warm()
+        {
+            if (!Config.Load().VoiceNatural) return;
+            var t = new Thread(delegate() { try { GetHost(); } catch (Exception ex) { Log.Write("voice warm: " + ex.Message); } });
+            t.IsBackground = true;
+            t.Start();
+        }
+
+        // סוגר את הדף
+        public static void Cool()
+        {
+            lock (hostLock) { if (host != null) host.Stop(); host = null; }
+        }
+
+        // מקריא ומחכה לסיום ההקראה
+        static void SayBlocking(string text, int gen)
+        {
+            if (gen != generation) return;
+            string script = Ps.Replace("@TEXT@", Convert.ToBase64String(Encoding.UTF8.GetBytes(text ?? "")))
+                              .Replace("@RATE@", Config.Load().VoiceRate.ToString(System.Globalization.CultureInfo.InvariantCulture))
+                              .Replace("@LANG@", IsHe ? "he" : "en");
+            var p = PsFile.Start(script, false);
+            current = p;
+            p.WaitForExit(60000);
+        }
+
+        public static void Speak(string text) { Call(text, 1, false, ""); }
+
+        // קורא repeats פעמים, ובין הקריאות מאזין. כששומעים "שנייה אני מגיע" וכד' - עוצר ועונה
+        public static void Call(string text, int repeats, bool listen, string reply, Action<string, bool> dictate = null)
+        {
+            Stop();
+            int gen = ++generation;
+            repeats = Math.Max(1, Math.Min(10, repeats));
+            bool natural = Config.Load().VoiceNatural;
+            DateTime callStart = DateTime.Now;
+            var t = new Thread(delegate()
+            {
+                VoiceListener l = null;
+                bool canListen = false, canNatural = false;
+                try
+                {
+                    if (listen || natural)
+                    {
+                        l = GetHost();
+                        if (l != null && gen == generation)
+                        {
+                            canNatural = natural && l.NaturalOk;
+                            if (natural && !canNatural) Log.Write("voice: no natural voice, using Windows voice");
+                            if (listen)
+                            {
+                                ShowListen(l);
+                                canListen = l.StartListen();
+                                if (!canListen) Log.Write("voice: listener not ready: " + l.Error);
+                            }
+                        }
+                    }
+                    var lst = l;
+                    Action<string> say = delegate(string x)
+                    {
+                        if (gen != generation) return;
+                        if (lst != null) lst.SetSpeaking(true);
+                        try { if (lst != null && canNatural) lst.Speak(x); else SayBlocking(x, gen); }
+                        finally { if (lst != null) lst.SetSpeaking(false); }
+                    };
+                    for (int i = 1; i <= repeats && gen == generation; i++)
+                    {
+                        if (i > 1 && UserActiveSince(callStart)) { Log.Write("voice: user is back, stopping calls"); break; }
+                        say(text);
+                        if (gen != generation) break;
+                        DateTime t0 = DateTime.Now;
+                        bool last = i == repeats;
+                        if (l != null && canListen)
+                        {
+                            for (int w = 0; w < 30 && gen == generation; w++)
+                            {
+                                Thread.Sleep(200);
+                                if (UserActiveSince(callStart)) { Log.Write("voice: user is back, stopping calls"); return; }
+                                string h = l.HeardSince(t0);
+                                if (IsAck(h))
+                                {
+                                    Log.Write("voice: heard ack [" + h.Trim() + "]");
+                                    if (!string.IsNullOrEmpty(reply)) say(reply);
+                                    if (dictate != null) Dictate(l, gen, dictate, Config.Load().VoiceNeedSend);
+                                    return;
+                                }
+                            }
+                        }
+                        else if (!last) Thread.Sleep(5000);
+                    }
+                }
+                catch (Exception ex) { Log.Write("voice error: " + ex.Message); }
+                finally { if (l != null && canListen) l.StopListen(); if (listen) HideListen(); }
+            });
+            t.IsBackground = true;
+            t.Start();
+        }
+
+        // אחרי שהמשתמש אמר שהוא מגיע: מאזינים להוראה שלו. מסיימים אחרי כמה שניות של שקט.
+        // אם בסוף נאמר "שלח" - שולחים. אחרת (כשההגדרה "שלח רק כשאני אומר שלח" דלוקה) רק מקלידים
+        static void Dictate(VoiceListener l, int gen, Action<string, bool> done, bool needSend)
+        {
+            DateTime t0 = DateTime.Now, start = DateTime.Now, lastAt = DateTime.MinValue;
+            string text = "";
+            while (gen == generation && (DateTime.Now - start).TotalSeconds < 90)
+            {
+                Thread.Sleep(250);
+                string fin = l.FinalsSince(t0);
+                if (fin.Length == 0) { if ((DateTime.Now - start).TotalSeconds > 20) break; continue; }   // 20 שניות להתחיל לדבר
+                if (fin != text) { text = fin; lastAt = DateTime.Now; }
+                if ((DateTime.Now - lastAt).TotalSeconds >= 2.5) break;
+            }
+            if (gen != generation || text.Length == 0) return;
+            bool send = !needSend;
+            string clean = text;
+            var m = Regex.Match(text, @"[\s,.!?]*(?:שלח|תשלח|שלחי|send)[\s,.!?]*$", RegexOptions.IgnoreCase);
+            if (m.Success) { send = true; clean = text.Substring(0, m.Index).Trim(); }
+            Log.Write("voice: dictation [" + clean + "] send=" + send);
+            if (clean.Length > 0) done(clean, send);
+        }
+
+        // בדיקת האזנה: מאזין 12 שניות ומחזיר את מה ששמע
+        public static void TestListen(Action<string> done)
+        {
+            Stop();
+            int gen = ++generation;
+            var t = new Thread(delegate()
+            {
+                string result;
+                VoiceListener l = null;
+                bool started = false;
+                try
+                {
+                    l = GetHost();
+                    if (l != null) ShowListen(l);
+                    if (l == null) result = L.T("ההאזנה נכשלה: לא נמצא Edge או Chrome", "Listening failed: Edge or Chrome not found");
+                    else if (!(started = l.StartListen())) result = L.T("הדפדפן לא התחיל להאזין. אשר גישה למיקרופון בחלון שנפתח. ", "The browser did not start listening. Allow microphone access in the window. ") + l.Error;
+                    else
+                    {
+                        DateTime t0 = DateTime.Now;
+                        while ((DateTime.Now - t0).TotalSeconds < 12 && gen == generation) Thread.Sleep(200);
+                        Thread.Sleep(1200); // משפט סופי יכול להגיע שנייה אחרי סוף הדיבור
+                        string all = l.HeardSince(t0);
+                        string fin = l.FinalsSince(t0);
+                        string h = fin.Length > 0 ? fin : l.LastSince(t0);
+                        result = h.Length == 0 ? L.T("לא שמעתי כלום.", "Heard nothing.")
+                            : L.T("שמעתי: ", "Heard: ") + h + (IsAck(all) ? L.T("  ✓ זוהה כאישור", "  ✓ recognized as an answer") : L.T("  (לא זוהה כאישור)", "  (not recognized as an answer)"));
+                    }
+                }
+                catch (Exception ex) { result = ex.Message; }
+                finally { if (l != null && started) l.StopListen(); HideListen(); }
+                done(result);
+            });
+            t.IsBackground = true;
+            t.Start();
+        }
+
+        // עוצר הקראה והאזנה מיד (הדף נשאר פתוח, מוכן לפעם הבאה)
+        public static void Stop()
+        {
+            generation++;
+            try { if (current != null && !current.HasExited) current.Kill(); } catch { }
+            current = null;
+            var h = host;
+            if (h != null) h.Abort();
         }
     }
 
@@ -625,6 +1420,12 @@ namespace ClaudeNotify
     // ---------------------------------------------------------------- Text helpers
     static class TextUtil
     {
+        // מסיר ניקוד וטעמי מקרא (נשאיר מקף עברי), כדי שהחלון הקופץ יציג טקסט נקי
+        public static string StripNikud(string t)
+        {
+            return string.IsNullOrEmpty(t) ? t : Regex.Replace(t, "[\u0591-\u05BD\u05BF\u05C1\u05C2\u05C4\u05C5\u05C7]", "");
+        }
+
         public static string Str(Dictionary<string, object> d, string key)
         {
             object o;
@@ -750,11 +1551,21 @@ namespace ClaudeNotify
         }
 
         // מחזיר null בכל כשל
-        public static string Run(string text, int maxWords)
+        public static string Run(string text, int maxWords, bool nikud = false)
         {
             string input = text.Length > 6000 ? text.Substring(0, 6000) : text;
+            if (!Voice.IsHe)
+            {
+                string pe = "Summarize the following message in English in at most " + Math.Max(5, maxWords - 5) +
+                    " words, short and clear. Return only the summary, with no preface and no formatting marks.\n\n--- MESSAGE ---\n" + input;
+                string errE;
+                string se = Ask(pe, 40000, out errE);
+                return string.IsNullOrEmpty(se) ? null : se;
+            }
             string prompt = "סכם את ההודעה הבאה בעברית בעד " + Math.Max(5, maxWords - 5) +
-                " מילים, בניסוח קצר וברור. החזר רק את הסיכום, בלי הקדמה ובלי סימוני עיצוב.\n\n--- ההודעה ---\n" + input;
+                " מילים, בניסוח קצר וברור. החזר רק את הסיכום, בלי הקדמה ובלי סימוני עיצוב." +
+                (nikud ? " נקד את הסיכום בניקוד מלא ותקני (תנועות, שווא, דגש) כדי שיוקרא נכון בקול. בלי הסברים." : "") +
+                "\n\n--- ההודעה ---\n" + input;
             string err;
             string s = Ask(prompt, 40000, out err);
             return string.IsNullOrEmpty(s) ? null : s;
@@ -950,8 +1761,9 @@ namespace ClaudeNotify
     class TrayContext : ApplicationContext
     {
         readonly NotifyIcon tray;
-        readonly Form host;
+        readonly HotkeyForm host;
         readonly ToolStripMenuItem enabledItem;
+        readonly ToolStripMenuItem voiceItem = new ToolStripMenuItem();
         Config cfg;
         SettingsForm settings;
         readonly ScheduleRunner sched;
@@ -966,7 +1778,8 @@ namespace ClaudeNotify
         {
             runOnce = runSchedule;
             cfg = Config.Load();
-            host = new Form();
+            host = new HotkeyForm();
+            Voice.Ui = host;
             var handle = host.Handle; // יוצר handle כדי לאפשר BeginInvoke מ-threads אחרים
             sched = new ScheduleRunner(host);
             sched.Started += UpdateTrayText;
@@ -977,6 +1790,10 @@ namespace ClaudeNotify
             tray.Text = "Claude Notify";
             enabledItem = new ToolStripMenuItem();
             enabledItem.Click += delegate { cfg.Enabled = !cfg.Enabled; cfg.Save(); SyncEnabled(); };
+            voiceItem.Click += delegate { ToggleVoice(); };
+            host.Pressed += ToggleVoice;
+            RegisterVoiceHotkey();
+            if (cfg.VoiceNatural && (cfg.VoiceEnabled || !cfg.VoiceLowMem)) Voice.Warm();
             BuildMenu();
             tray.MouseDoubleClick += delegate(object s, MouseEventArgs e) { if (e.Button == MouseButtons.Left) ShowSettings(); };
             tray.BalloonTipClicked += delegate { if (lastTarget != 0) WinApi.FocusSession(lastTarget, lastSession); };
@@ -1005,17 +1822,104 @@ namespace ClaudeNotify
             menu.Items.Add(L.T("הגדרות...", "Settings..."), null, delegate { ShowSettings(); });
             enabledItem.Text = L.T("התראות פעילות", "Notifications on");
             menu.Items.Add(enabledItem);
-            menu.Items.Add(L.T("התראת בדיקה", "Test notification"), null, delegate { TestNotification(); });
             menu.Items.Add(L.T("הודעה מתוזמנת (פתיחת מכסה)...", "Scheduled message (start quota)..."), null, delegate { ShowSchedule(); });
             menu.Items.Add(L.T("מידע טכני...", "Technical info..."), null, delegate { ShowUsage(); });
+            menu.Items.Add(L.T("עזרה והסברים...", "Help..."), null, delegate { ShowHelp(); });
             menu.Items.Add(new ToolStripSeparator());
-            menu.Items.Add(L.T("יציאה", "Exit"), null, delegate { sched.Cancel(); tray.Visible = false; Application.Exit(); });
+            menu.Items.Add(L.T("יציאה", "Exit"), null, delegate { sched.Cancel(); Voice.Cool(); tray.Visible = false; Application.Exit(); });
             MenuStyle.Apply(menu);
             tray.ContextMenuStrip = menu;
         }
 
+        void RegisterVoiceHotkey()
+        {
+            if (!string.IsNullOrEmpty(cfg.VoiceHotkey) && !host.Register(cfg.VoiceHotkey))
+            {
+                Log.Write("voice hotkey not registered: " + cfg.VoiceHotkey);
+                tray.ShowBalloonTip(6000, "Claude Notify", L.T("קיצור המקשים " + cfg.VoiceHotkey + " תפוס על ידי תוכנה אחרת. בחר קיצור אחר בהגדרות.", "The hotkey " + cfg.VoiceHotkey + " is taken by another app. Choose a different one in Settings."), ToolTipIcon.Warning);
+            }
+        }
+
+        System.Threading.Timer lowMemTimer;
+
+        void ToggleVoice()
+        {
+            cfg.VoiceEnabled = !cfg.VoiceEnabled;
+            cfg.Save();
+            voiceItem.Checked = cfg.VoiceEnabled;
+            if (settings != null) settings.Reload();
+            if (voiceForm != null && !voiceForm.IsDisposed) voiceForm.Reload();
+            if (!cfg.VoiceEnabled) Voice.Stop();
+            if (cfg.VoiceEnabled) Voice.Warm();
+            else if (cfg.VoiceLowMem)
+            {
+                // חיסכון בזיכרון: סוגרים את הדף אחרי שההודעה על הכיבוי נשמעה
+                if (lowMemTimer != null) lowMemTimer.Dispose();
+                lowMemTimer = new System.Threading.Timer(delegate { if (!cfg.VoiceEnabled) Voice.Cool(); }, null, 10000, Timeout.Infinite);
+            }
+            if (cfg.VoiceAnnounce)
+                Voice.Speak(cfg.VoiceEnabled ? Voice.T("הַקרִיאָה בְּקוֹל הוּפְעֲלָה", "Voice call is on") : Voice.T("הַקרִיאָה בְּקוֹל כֻּבְּתָה", "Voice call is off"));
+        }
+
+        // ההודעה שמוקראת: פנייה בשם שהמשתמש הזין, ואחריה הטקסט (אם יש)
+        public void TestSpeak()
+        {
+            Voice.Call(VoiceText(Voice.T("זו בדיקת הקראה.", "This is a voice test.")), 1, false, "");
+        }
+
+        public void TestListen()
+        {
+            Show(0, L.T("מאזין 12 שניות. אמור \"שנייה אני מגיע\"", "Listening for 12 seconds. Say \"just a second, I'm coming\""), "", "", L.T("בדיקת האזנה", "Listening test"));
+            Voice.TestListen(delegate(string r)
+            {
+                host.BeginInvoke(new Action(delegate { Show(0, r, "", "", L.T("בדיקת האזנה", "Listening test")); }));
+            });
+        }
+
+        void SpeakCall(string body, long target, string conv)
+        {
+            if (cfg.VoiceIdleSeconds > 0 && Voice.IdleSeconds() < cfg.VoiceIdleSeconds)
+            {
+                Log.Write("voice: skipped, user is at the computer (idle " + (int)Voice.IdleSeconds() + "s)");
+                return;
+            }
+            bool dict = cfg.VoiceDictate && cfg.VoiceListen && target != 0;
+            Action<string, bool> cb = null;
+            if (dict) cb = delegate(string t, bool send) { host.BeginInvoke(new Action(delegate { SendDictation(target, t, send, conv); })); };
+            Voice.Call(VoiceText(body), cfg.VoiceRepeats, cfg.VoiceListen,
+                dict ? Voice.T("בסדר, אני מקשיב", "OK, I'm listening") : Voice.T("בסדר, אני מחכה לך", "OK, I'll wait for you"), cb);
+        }
+
+        // מקליד את מה שהוכתב בתיבת השיחה של חלון ה-VS Code שממנו הגיעה ההתראה (בעזרת המנגנון של ההודעה המתוזמנת)
+        void SendDictation(long target, string text, bool send, string conv)
+        {
+            try
+            {
+                string key = "";
+                foreach (var w in VsWindows.List()) if (w.Handle == target) { key = w.Key; break; }
+                if (key.Length == 0) { Show(0, L.T("לא מצאתי את חלון ה-VS Code להקלדה", "Could not find the VS Code window to type into"), "", "", "Claude Notify"); return; }
+                var sc = new SchedConfig();
+                sc.Method = "vscode"; sc.NewChat = false; sc.Text = text; sc.SendEnter = send;
+                sc.KeepAwake = false; sc.Wake = false;
+                sc.WindowKeys = new List<string> { key };
+                // כותרת השיחה עוזרת להבחין בין חלונות עם אותה כותרת
+                if (!string.IsNullOrEmpty(conv)) sc.WindowConvs[key] = conv;
+                string err = sched.Start(sc, true);
+                if (err != null) Show(0, L.Tr(err), "", "", "Claude Notify");
+            }
+            catch (Exception ex) { Log.Write("dictation error: " + ex.Message); }
+        }
+
+        string VoiceText(string body)
+        {
+            string name = (cfg.UserName ?? "").Trim();
+            string head = (name.Length > 0 ? name + " - " : "") + Voice.T(cfg.VoiceNikud ? "קלוֹד סִיֵּים לְהָשִׁיב." : "קלוד סיים להשיב.", "Claude has finished replying.");
+            return string.IsNullOrEmpty(body) ? head : head + " " + body;
+        }
+
         void SyncEnabled()
         {
+            voiceItem.Checked = cfg.VoiceEnabled;
             enabledItem.Checked = cfg.Enabled;
             UpdateTrayText();
             if (settings != null) settings.Reload();
@@ -1042,6 +1946,25 @@ namespace ClaudeNotify
             }
         }
 
+        VoiceForm voiceForm;
+        public void ShowVoice()
+        {
+            if (voiceForm == null || voiceForm.IsDisposed) voiceForm = new VoiceForm(this);
+            voiceForm.Reload();
+            voiceForm.Show();
+            voiceForm.WindowState = FormWindowState.Normal;
+            voiceForm.Activate();
+        }
+
+        HelpForm helpForm;
+        public void ShowHelp()
+        {
+            if (helpForm == null || helpForm.IsDisposed) helpForm = new HelpForm();
+            helpForm.Show();
+            helpForm.WindowState = FormWindowState.Normal;
+            helpForm.Activate();
+        }
+
         public void ShowUsage()
         {
             if (usageForm == null || usageForm.IsDisposed) usageForm = new UsageForm();
@@ -1065,6 +1988,8 @@ namespace ClaudeNotify
             bool langChanged = (c.Language == "en") == L.He;
             cfg = c;
             L.Load(c.Language);
+            RegisterVoiceHotkey();
+            if (c.VoiceNatural && (c.VoiceEnabled || !c.VoiceLowMem)) Voice.Warm(); else Voice.Cool();
             SyncEnabled();
             if (!langChanged) return;
             // החלפת שפה: בונים מחדש את התפריט והחלונות, ופותחים שוב את ההגדרות
@@ -1075,6 +2000,9 @@ namespace ClaudeNotify
                 if (settings != null) { settings.Dispose(); settings = null; }
                 if (schedForm != null) { schedForm.Dispose(); schedForm = null; }
                 if (usageForm != null) { usageForm.Dispose(); usageForm = null; }
+                if (helpForm != null) { helpForm.Dispose(); helpForm = null; }
+                if (voiceForm != null) { voiceForm.Dispose(); voiceForm = null; }
+                Voice.ResetListenWindow();
                 ShowSettings();
             }));
         }
@@ -1124,6 +2052,15 @@ namespace ClaudeNotify
                 if (TextUtil.Str(j, "__cmd") == "settings") ShowSettings();
                 if (TextUtil.Str(j, "__cmd") == "schedule") ShowSchedule();
                 if (TextUtil.Str(j, "__cmd") == "usage") ShowUsage();
+                if (TextUtil.Str(j, "__cmd") == "testlisten") TestListen();
+                if (TextUtil.Str(j, "__cmd") == "voice") ShowVoice();
+                if (TextUtil.Str(j, "__cmd") == "help") ShowHelp();
+                if (TextUtil.Str(j, "__cmd") == "shot")
+                {
+                    string which = TextUtil.Str(j, "which"), path = TextUtil.Str(j, "path");
+                    PageForm f = which == "voice" ? (PageForm)voiceForm : which == "help" ? (PageForm)helpForm : settings;
+                    if (f != null && path.Length > 0) f.SaveContentImage(path);
+                }
                 return;
             }
             if (!cfg.Enabled) { Log.Write("skipped: disabled"); return; }
@@ -1147,6 +2084,7 @@ namespace ClaudeNotify
             if (cfg.SkipWhenVisible && target != 0 && WinApi.IsShown(target))
             {
                 Log.Write("skipped: editor visible");
+                if (cfg.VoiceEnabled) SpeakCall(null, target, title);
                 return;
             }
             int heb = 0, qm = 0;
@@ -1157,18 +2095,24 @@ namespace ClaudeNotify
             if (cfg.Summarize && text.Trim().Length > 0)
             {
                 string src = text;
+                bool nik = cfg.VoiceEnabled && cfg.VoiceNikud && Voice.IsHe;
                 ThreadPool.QueueUserWorkItem(delegate
                 {
-                    string s = Summarizer.Run(src, max);
+                    string s = Summarizer.Run(src, max, nik);
                     host.BeginInvoke(new Action(delegate
                     {
                         // בזמן הסיכום ייתכן שהמשתמש כבר חזר לחלון
+                        if (cfg.VoiceEnabled) SpeakCall(TextUtil.FirstWords(s ?? src, max), target, title);
                         if (cfg.SkipWhenVisible && target != 0 && WinApi.IsShown(target)) return;
-                        Show(target, TextUtil.FirstWords(s ?? src, max), session, cwd, title);
+                        Show(target, TextUtil.StripNikud(TextUtil.FirstWords(s ?? src, max)), session, cwd, title);
                     }));
                 });
             }
-            else Show(target, TextUtil.FirstWords(text, max), session, cwd, title);
+            else
+            {
+                if (cfg.VoiceEnabled) SpeakCall(TextUtil.FirstWords(text, max), target, title);
+                Show(target, TextUtil.FirstWords(text, max), session, cwd, title);
+            }
         }
 
         // UI Automation: מחפש בכל חלון עורך רכיב ששמו בדיוק כותרת השיחה. רץ ב-PowerShell כדי לא להוסיף תלות בבנייה
@@ -1196,13 +2140,7 @@ foreach ($h in @(@HANDLES@)) {
                 string script = TitleSearchPs
                     .Replace("@TITLE@", Convert.ToBase64String(Encoding.UTF8.GetBytes(title)))
                     .Replace("@HANDLES@", string.Join(",", handles.ToArray()));
-                string enc = Convert.ToBase64String(Encoding.Unicode.GetBytes(script));
-                var psi = new ProcessStartInfo("powershell", "-NoProfile -NonInteractive -EncodedCommand " + enc);
-                psi.UseShellExecute = false;
-                psi.CreateNoWindow = true;
-                psi.RedirectStandardOutput = true;
-                psi.RedirectStandardError = true;
-                using (var p = Process.Start(psi))
+                using (var p = PsFile.Start(script, true))
                 {
                     var outTask = p.StandardOutput.ReadToEndAsync();
                     p.StandardError.ReadToEndAsync();

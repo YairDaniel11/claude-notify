@@ -296,8 +296,8 @@ namespace ClaudeNotify
             int textW = stacked || ctl == null ? width : width - ctlW - Theme.S(24);
             Title.RightToLeft = Desc.RightToLeft = rtl ? RightToLeft.Yes : RightToLeft.No;
             Title.TextAlign = Desc.TextAlign = ContentAlignment.TopLeft;
-            int th = Theme.TextHeight(Title.Text, Title.Font, textW, rtl);
-            int dh = Theme.TextHeight(Desc.Text, Desc.Font, textW, rtl);
+            int th = Theme.TextHeight(Title.Text, Title.Font, textW - Theme.S(10), rtl);
+            int dh = Theme.TextHeight(Desc.Text, Desc.Font, textW - Theme.S(10), rtl);
             int block = th + (dh > 0 ? dh + 1 : 0);
 
             if (stacked && ctl != null)
