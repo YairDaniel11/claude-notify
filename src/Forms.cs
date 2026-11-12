@@ -166,12 +166,12 @@ namespace ClaudeNotify
             btnUpdate.Click += delegate
             {
                 btnUpdate.Enabled = false;
-                UpdateCheck.CheckNow(this, delegate(int latest)
+                UpdateCheck.CheckNow(this, delegate(UpdateInfo latest)
                 {
                     btnUpdate.Enabled = true;
-                    if (latest < 0) Dialog.Show(this, "Claude Notify", L.T("לא הצלחתי לבדוק עדכון. בדוק את החיבור לאינטרנט ונסה שוב.", "Could not check for updates. Check your internet connection and try again."));
-                    else if (AppVersion.Build <= 0) Dialog.Show(this, "Claude Notify", L.T("זו בנייה מקומית ללא מספר גרסה. הגרסה האחרונה ב-GitHub היא 1.0." + latest + ".", "This is a local build with no version number. The latest version on GitHub is 1.0." + latest + "."));
-                    else if (latest > AppVersion.Build) { Dialog.Show(this, "Claude Notify", L.T("יש גרסה חדשה: 1.0." + latest + " (אצלך 1.0." + AppVersion.Build + "). דף ההורדה ייפתח עכשיו.", "A new version is available: 1.0." + latest + " (you have 1.0." + AppVersion.Build + "). The download page will open now.")); UpdateCheck.OpenPage(); }
+                    if (latest == null) Dialog.Show(this, "Claude Notify", L.T("לא הצלחתי לבדוק עדכון. בדוק את החיבור לאינטרנט ונסה שוב.", "Could not check for updates. Check your internet connection and try again."));
+                    else if (AppVersion.Build <= 0) Dialog.Show(this, "Claude Notify", L.T("זו בנייה מקומית ללא מספר גרסה, ולכן היא לא מתעדכנת מכאן. הגרסה האחרונה ב-GitHub היא " + latest.VersionText + ".", "This is a local build with no version number, so it is not updated from here. The latest version on GitHub is " + latest.VersionText + "."));
+                    else if (latest.Build > AppVersion.Build) ctx.ShowUpdate(latest);
                     else Dialog.Show(this, "Claude Notify", L.T("יש לך את הגרסה האחרונה (1.0." + AppVersion.Build + ").", "You have the latest version (1.0." + AppVersion.Build + ")."));
                 });
             };

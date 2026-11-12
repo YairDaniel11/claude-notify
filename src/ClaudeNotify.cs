@@ -2234,14 +2234,25 @@ foreach ($h in @(@HANDLES@)) {
         ToastForm toast;
 
         // התראה על גרסה חדשה; לחיצה פותחת את דף ההורדה
-        void ShowUpdateToast(int build)
+        void ShowUpdateToast(UpdateInfo info)
         {
             if (toast != null && !toast.IsDisposed) toast.Close();
-            toast = new ToastForm(L.T("גרסה 1.0." + build + " זמינה. לחץ כאן כדי לפתוח את דף ההורדה.", "Version 1.0." + build + " is available. Click here to open the download page."),
+            toast = new ToastForm(L.T("גרסה " + info.VersionText + " זמינה. לחץ כאן כדי להוריד ולהתקין.", "Version " + info.VersionText + " is available. Click here to download and install."),
                 L.T("יש גרסה חדשה של Claude Notify", "A new version of Claude Notify"), 0, "", "", 15, cfg.PopupLeft);
-            toast.OnClick = UpdateCheck.OpenPage;
+            toast.OnClick = delegate { ShowUpdate(info); };
             toast.Cursor = Cursors.Hand;
             toast.Show();
+        }
+
+        UpdateForm updateForm;
+
+        // חלון העדכון (הורדה, סגירה, החלפה ופתיחה מחדש)
+        public void ShowUpdate(UpdateInfo info)
+        {
+            if (updateForm != null && !updateForm.IsDisposed) { updateForm.Activate(); return; }
+            updateForm = new UpdateForm(info, delegate { sched.Cancel(); Voice.Cool(); tray.Visible = false; Application.Exit(); });
+            updateForm.Show();
+            updateForm.Activate();
         }
 
         void Show(long target, string body, string session, string cwd, string title)
