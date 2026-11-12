@@ -47,6 +47,20 @@ namespace ClaudeNotify
         }
 
         // פרטי ה-Release האחרון ב-GitHub. זורק חריגה אם הבדיקה נכשלה
+        // מסיר מהערות הגרסה את הנוסח הקבוע של ה-workflow (גרסה אוטומטית מהקומיט..., הוראות הורדה ידנית). נשאר רק תיאור השינוי
+        static string CleanNotes(string body)
+        {
+            var keep = new List<string>();
+            foreach (string line in body.Replace("\r\n", "\n").Split('\n'))
+            {
+                string t = line.Trim();
+                if (t.StartsWith("להורדה:")) break;
+                if (t.StartsWith("גרסה אוטומטית מהקומיט")) continue;
+                keep.Add(t);
+            }
+            return string.Join("\r\n", keep.ToArray()).Trim();
+        }
+
         static UpdateInfo FetchLatest()
         {
             try { ServicePointManager.SecurityProtocol |= (SecurityProtocolType)3072; } catch { }
@@ -64,7 +78,7 @@ namespace ClaudeNotify
             info.Build = ParseBuild(tagObj.ToString());
             info.PageUrl = ReleasesPage;
             object o;
-            if (d.TryGetValue("body", out o) && o != null) info.Notes = o.ToString().Replace("\r\n", "\n").Replace("\n", "\r\n");
+            if (d.TryGetValue("body", out o) && o != null) info.Notes = CleanNotes(o.ToString());
             if (d.TryGetValue("assets", out o) && o is IEnumerable)
                 foreach (object a in (IEnumerable)o)
                 {

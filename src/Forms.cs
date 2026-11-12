@@ -313,6 +313,8 @@ namespace ClaudeNotify
     {
         readonly TrayContext ctx;
         Config cfg;
+        ToggleSwitch tglHours;
+        HoursEditor hours;
         ToggleSwitch tglVoice, tglListen, tglShowWin, tglNatural, tglAnnounce, tglNikud, tglDictate, tglNeedSend, tglLowMem;
         Dropdown cmbGender, cmbRate, cmbVLang, cmbWinPos;
         static readonly string[] PosKeys = { "br", "bl", "tr", "tl", "center" };
@@ -334,6 +336,17 @@ namespace ClaudeNotify
             AddRow(cv, L.T("כמה פעמים לקרוא", "How many times to call"), L.T("מספר הקריאות ברצף, עד שעונים לו.", "Number of calls in a row, until you answer."), numRepeats, false, 124, null);
             numIdle = Ctl.Num(0, 600);
             AddRow(cv, L.T("קרא רק אם לא נגעתי במחשב (שניות)", "Call only if I did not touch the computer (seconds)"), L.T("אם אתה עובד על המחשב, הוא לא יקרא לך. 0 = תמיד לקרוא. אם חוזרים למחשב באמצע - הקריאות נפסקות.", "If you are working at the computer, it will not call you. 0 = always call. If you come back in the middle, the calls stop."), numIdle, false, 124, null);
+            tglHours = new ToggleSwitch();
+            AddRow(cv, L.T("קרא רק בשעות מסוימות", "Call only during certain hours"), L.T("כבוי = קורא בכל שעה. דלוק = קורא רק בטווח השעות שתבחר למטה, ושותק מחוץ אליו.", "Off = calls at any hour. On = calls only within the hours chosen below, and stays silent outside them."), tglHours, false, 54, null);
+            hours = new HoursEditor();
+            AddRow(cv, L.T("הטווחים שבהם מותר לקרוא", "Hours in which calling is allowed"), L.T("אפשר להוסיף כמה טווחים, למשל בוקר 12:00-14:30 וצהריים 17:45-19:32. אם הסוף קטן מההתחלה, הטווח חוצה חצות (22:00-06:00 = לילה).", "You can add several ranges, for example morning 12:00-14:30 and afternoon 17:45-19:32. If the end is earlier than the start, the range crosses midnight (22:00-06:00 = night)."), hours, true, 0, null);
+            hours.HeightChanged += delegate
+            {
+                var st = hours.Parent != null ? hours.Parent.Parent as Stack : null;
+                if (st != null) st.Relayout();
+                FitContent();
+            };
+            tglHours.CheckedChanged += delegate { hours.Enabled = tglHours.Checked; };
             tglListen = new ToggleSwitch();
             AddRow(cv, L.T("האזן לתשובה שלי", "Listen for my answer"), L.T("אומרים \"שנייה אני מגיע\" והוא מפסיק לקרוא. משתמש בזיהוי הדיבור של Edge/Chrome ודורש מיקרופון.", "Say \"just a second, I'm coming\" and it stops calling. Uses Edge/Chrome speech recognition and needs a microphone."), tglListen, false, 54, null);
             tglDictate = new ToggleSwitch();
@@ -404,6 +417,9 @@ namespace ClaudeNotify
             tglVoice.Checked = cfg.VoiceEnabled;
             numRepeats.Value = Math.Max(numRepeats.Minimum, Math.Min(numRepeats.Maximum, cfg.VoiceRepeats));
             numIdle.Value = Math.Max(numIdle.Minimum, Math.Min(numIdle.Maximum, cfg.VoiceIdleSeconds));
+            tglHours.Checked = cfg.VoiceHoursOn;
+            hours.Value = cfg.VoiceRanges;
+            hours.Enabled = cfg.VoiceHoursOn;
             tglListen.Checked = cfg.VoiceListen;
             tglShowWin.Checked = cfg.VoiceShowWindow;
             tglNatural.Checked = cfg.VoiceNatural;
@@ -431,6 +447,8 @@ namespace ClaudeNotify
             cfg.VoiceEnabled = tglVoice.Checked;
             cfg.VoiceRepeats = (int)numRepeats.Value;
             cfg.VoiceIdleSeconds = (int)numIdle.Value;
+            cfg.VoiceHoursOn = tglHours.Checked;
+            cfg.VoiceRanges = hours.Value;
             cfg.VoiceListen = tglListen.Checked;
             cfg.VoiceShowWindow = tglShowWin.Checked;
             cfg.VoiceNatural = tglNatural.Checked;

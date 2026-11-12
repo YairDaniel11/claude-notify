@@ -394,13 +394,162 @@ namespace ClaudeNotify
             base.OnLayout(e);
             int colon = Theme.S(14), w = h.Width;
             // תמיד שעות מצד שמאל ושניות מצד ימין, כמו שעון דיגיטלי
-            int total = w * 3 + colon * 2;
+            int total = showSeconds ? w * 3 + colon * 2 : w * 2 + colon;
             int x0 = Math.Max(0, (Width - total) / 2);
             h.Location = new Point(x0, 0);
             c1.SetBounds(x0 + w, 0, colon, Height);
             m.Location = new Point(x0 + w + colon, 0);
+            c2.Visible = s.Visible = showSeconds;
             c2.SetBounds(x0 + w * 2 + colon, 0, colon, Height);
             s.Location = new Point(x0 + w * 2 + colon * 2, 0);
+        }
+
+        bool showSeconds = true;
+        // false = שעות ודקות בלבד (השניות נשארות 0)
+        public bool ShowSeconds { get { return showSeconds; } set { showSeconds = value; PerformLayout(); } }
+    }
+
+    // שעה קומפקטית: שני שדות (שעות, דקות) בלי חיצים גדולים. תמיד שעות משמאל ודקות מימין
+    class MiniTime : Panel
+    {
+        readonly Stepper h = new Stepper(), m = new Stepper();
+        readonly Label colon = new Label();
+
+        public MiniTime()
+        {
+            BackColor = Theme.Card;
+            h.Minimum = 0; h.Maximum = 23; h.Format = "00";
+            m.Minimum = 0; m.Maximum = 59; m.Format = "00";
+            h.Size = m.Size = new Size(Theme.S(72), Theme.S(26));
+            colon.Text = ":"; colon.AutoSize = false; colon.TextAlign = ContentAlignment.MiddleCenter; colon.Font = Theme.Semi(12f); colon.ForeColor = Theme.Muted; colon.BackColor = Theme.Card;
+            int cw = Theme.S(12);
+            h.Location = new Point(0, 0);
+            colon.SetBounds(h.Width, 0, cw, h.Height);
+            m.Location = new Point(h.Width + cw, 0);
+            Size = new Size(h.Width * 2 + cw, h.Height);
+            Controls.AddRange(new Control[] { h, colon, m });
+        }
+
+        public TimeSpan Time
+        {
+            get { return new TimeSpan((int)h.Value, (int)m.Value, 0); }
+            set { h.Value = value.Hours; m.Value = value.Minutes; }
+        }
+
+        protected override void OnEnabledChanged(EventArgs e) { base.OnEnabledChanged(e); h.Enabled = m.Enabled = Enabled; }
+    }
+
+    // רשימה של טווחי שעות ("מ-08:00 עד 10:00"), עם כפתורי הסרה והוספה. הערך: "HH:mm-HH:mm;HH:mm-HH:mm"
+    class HoursEditor : Panel
+    {
+        class RangeRow : Panel
+        {
+            public readonly MiniTime From = new MiniTime(), To = new MiniTime();
+            public readonly Label LblFrom = new Label(), LblTo = new Label();
+            public readonly PillButton Remove = new PillButton("×", false);
+
+            public RangeRow()
+            {
+                BackColor = Theme.Card;
+                foreach (var l in new[] { LblFrom, LblTo })
+                {
+                    l.AutoSize = false; l.Font = Theme.F(10f); l.ForeColor = Theme.Text; l.BackColor = Theme.Card; l.TextAlign = ContentAlignment.MiddleCenter;
+                }
+                LblFrom.Text = L.T("מ", "From");
+                LblTo.Text = L.T("עד", "to");
+                Remove.Width = Theme.S(36); Remove.Height = Theme.S(26);
+                Height = From.Height;
+                Controls.AddRange(new Control[] { LblFrom, From, LblTo, To, Remove });
+            }
+
+            // מסדר משמאל לימין או מימין לשמאל לפי כיוון הממשק. הסדר הלוגי: "מהשעה" שעה, "עד" שעה, הסר
+            public void LayoutRow(int width, bool rtl)
+            {
+                int gap = Theme.S(6);
+                int wf = TextRenderer.MeasureText(LblFrom.Text, LblFrom.Font).Width + Theme.S(6);
+                int wt = TextRenderer.MeasureText(LblTo.Text, LblTo.Font).Width + Theme.S(6);
+                var items = new Control[] { LblFrom, From, LblTo, To };
+                var widths = new[] { wf, From.Width, wt, To.Width };
+                int x = rtl ? width : 0;
+                for (int i = 0; i < items.Length; i++)
+                {
+                    if (rtl) x -= widths[i];
+                    items[i].SetBounds(x, items[i] is Label ? 0 : 0, widths[i], Height);
+                    x = rtl ? x - gap : x + widths[i] + gap;
+                }
+                Remove.Location = new Point(rtl ? 0 : width - Remove.Width, (Height - Remove.Height) / 2);
+            }
+        }
+
+        readonly List<RangeRow> rows = new List<RangeRow>();
+        readonly PillButton add = new PillButton(L.T("הוסף טווח", "Add range"), false);
+        public event EventHandler HeightChanged;
+        bool busy;
+
+        public HoursEditor()
+        {
+            BackColor = Theme.Card;
+            Controls.Add(add);
+            add.Click += delegate { AddRange(new TimeSpan(12, 0, 0), new TimeSpan(14, 0, 0)); Relayout(); };
+        }
+
+        void AddRange(TimeSpan a, TimeSpan b)
+        {
+            var r = new RangeRow();
+            r.From.Time = a; r.To.Time = b;
+            r.Remove.Click += delegate { if (rows.Count > 1) { rows.Remove(r); Controls.Remove(r); r.Dispose(); Relayout(); } };
+            rows.Add(r);
+            Controls.Add(r);
+            r.Enabled = Enabled;
+        }
+
+        public string Value
+        {
+            get
+            {
+                var parts = new List<string>();
+                foreach (var r in rows) parts.Add(r.From.Time.ToString(@"hh\:mm") + "-" + r.To.Time.ToString(@"hh\:mm"));
+                return string.Join(";", parts.ToArray());
+            }
+            set
+            {
+                foreach (var r in rows) { Controls.Remove(r); r.Dispose(); }
+                rows.Clear();
+                foreach (var p in Config.ParseRanges(value)) AddRange(p[0], p[1]);
+                if (rows.Count == 0) AddRange(new TimeSpan(8, 0, 0), new TimeSpan(22, 0, 0));
+                Relayout();
+            }
+        }
+
+        public void Relayout()
+        {
+            if (busy) return;
+            busy = true;
+            try
+            {
+                bool rtl = L.He;
+                int gap = Theme.S(8), y = 0;
+                foreach (var r in rows)
+                {
+                    r.SetBounds(0, y, Width, r.Height);
+                    r.LayoutRow(Width, rtl);
+                    r.Remove.Visible = rows.Count > 1;
+                    y += r.Height + gap;
+                }
+                add.Location = new Point(rtl ? Width - add.Width : 0, y);
+                int h = y + add.Height;
+                if (h != Height) { Height = h; if (HeightChanged != null) HeightChanged(this, EventArgs.Empty); }
+            }
+            finally { busy = false; }
+        }
+
+        protected override void OnResize(EventArgs e) { base.OnResize(e); Relayout(); }
+
+        protected override void OnEnabledChanged(EventArgs e)
+        {
+            base.OnEnabledChanged(e);
+            foreach (var r in rows) r.Enabled = Enabled;
+            add.Enabled = Enabled;
         }
     }
 

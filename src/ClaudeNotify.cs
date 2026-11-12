@@ -346,11 +346,43 @@ namespace ClaudeNotify
         public bool VoiceNatural { get; set; }   // קול טבעי של Edge (דורש אינטרנט)
         public bool VoiceListen { get; set; }    // האזנה לתשובה בקול
         public bool CheckUpdates { get; set; }   // התראה כשיש גרסה חדשה ב-GitHub
+        public bool VoiceHoursOn { get; set; }   // להגביל את הקריאה בקול לטווח שעות
+        public string VoiceRanges { get; set; }  // טווחי השעות, "HH:mm-HH:mm;HH:mm-HH:mm" (אם הסוף קטן מההתחלה - הטווח חוצה חצות)
+
+        static bool ParseHm(string s, out TimeSpan t)
+        {
+            return TimeSpan.TryParseExact((s ?? "").Trim(), @"hh\:mm", System.Globalization.CultureInfo.InvariantCulture, out t);
+        }
+
+        // מפרק את מחרוזת הטווחים לזוגות (התחלה, סוף). טווחים לא תקינים או ריקים (התחלה = סוף) מדולגים
+        public static List<TimeSpan[]> ParseRanges(string s)
+        {
+            var list = new List<TimeSpan[]>();
+            foreach (string part in (s ?? "").Split(';'))
+            {
+                string[] ab = part.Split('-');
+                TimeSpan a, b;
+                if (ab.Length == 2 && ParseHm(ab[0], out a) && ParseHm(ab[1], out b) && a != b) list.Add(new[] { a, b });
+            }
+            return list;
+        }
+
+        // האם עכשיו בתוך אחד מטווחי ההקראה. כשההגבלה כבויה או שאין טווח תקין - תמיד כן
+        public bool VoiceAllowedNow()
+        {
+            if (!VoiceHoursOn) return true;
+            var ranges = ParseRanges(VoiceRanges);
+            if (ranges.Count == 0) return true;
+            TimeSpan now = DateTime.Now.TimeOfDay;
+            foreach (var r in ranges)
+                if (r[0] < r[1] ? (now >= r[0] && now < r[1]) : (now >= r[0] || now < r[1])) return true;
+            return false;
+        }
 
         public Config()
         {
             VoiceEnabled = false; UserName = ""; VoiceRepeats = 3; VoiceListen = true; VoiceNatural = true; VoiceGender = "male"; VoiceLang = "auto"; VoicePos = "br"; VoiceIdleSeconds = 60; VoiceRate = 1.0; VoiceAnnounce = true; VoiceNikud = true; VoiceDictate = false; VoiceNeedSend = true; VoiceLowMem = false; VoiceHotkey = "Ctrl+Alt+V";
-            DisplaySeconds = 8; UseCustomPopup = true; Language = "he"; CheckUpdates = true;
+            DisplaySeconds = 8; UseCustomPopup = true; Language = "he"; CheckUpdates = true; VoiceRanges = "08:00-22:00";
             Enabled = true; Summarize = true; MaxWords = 30; SkipWhenVisible = true;
             Processes = "Code, Code - Insiders, Cursor";
         }
@@ -1010,6 +1042,18 @@ Remove-Item $wav -Force
             var t = new Thread(delegate() { try { GetHost(); } catch (Exception ex) { Log.Write("voice warm: " + ex.Message); } });
             t.IsBackground = true;
             t.Start();
+        }
+
+        // האם דף הקול הטבעי כבר פתוח ומוכן (אחרת ההקראה הראשונה תתעכב כמה שניות)
+        public static bool HostReady
+        {
+            get
+            {
+                // GetHost מחזיק את הנעילה בזמן פתיחת הדף, ולכן לא מחכים לה (זה נקרא מחוט הממשק)
+                if (!Monitor.TryEnter(hostLock)) return false;
+                try { return host != null && host.IsAlive && host.TtsReported; }
+                finally { Monitor.Exit(hostLock); }
+            }
         }
 
         // סוגר את הדף
@@ -1889,6 +1933,9 @@ Remove-Item $wav -Force
         // ההודעה שמוקראת: פנייה בשם שהמשתמש הזין, ואחריה הטקסט (אם יש)
         public void TestSpeak()
         {
+            // הדף של הקול הטבעי סגור (חיסכון בזיכרון / שינוי הגדרות קול) - פתיחתו לוקחת כמה שניות, אז מודיעים מיד
+            if (cfg.VoiceNatural && !Voice.HostReady)
+                Show(0, L.T("מכין את הקול, ההקראה תתחיל בעוד כמה שניות...", "Preparing the voice, speaking will start in a few seconds..."), "", "", L.T("בדיקת הקראה", "Speaking test"));
             Voice.Call(VoiceText(Voice.T("זו בדיקת הקראה.", "This is a voice test.")), 1, false, "");
         }
 
@@ -1903,6 +1950,11 @@ Remove-Item $wav -Force
 
         void SpeakCall(string body, long target, string conv)
         {
+            if (!cfg.VoiceAllowedNow())
+            {
+                Log.Write("voice: skipped, outside the allowed hours (" + cfg.VoiceRanges + ")");
+                return;
+            }
             if (cfg.VoiceIdleSeconds > 0 && Voice.IdleSeconds() < cfg.VoiceIdleSeconds)
             {
                 Log.Write("voice: skipped, user is at the computer (idle " + (int)Voice.IdleSeconds() + "s)");
