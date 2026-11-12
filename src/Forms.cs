@@ -63,6 +63,27 @@ namespace ClaudeNotify
         {
             content.Width = Math.Max(300, host.ClientSize.Width);
             content.Relayout();
+            // טווח הגלילה של Panel רק גדל ולא קטן: אם התוכן נמדד פעם אחת צר וגבוה (למשל לפני שהחלון קיבל גודל),
+            // נשאר אחרי זה אזור ריק בסוף הגלילה. כשהתוכן הצטמצם - מאפסים את החישוב של האזור הנגלל
+            // (הטווח מתעדכן רק אחרי שהחלון סיים להתפרס, ולכן הבדיקה נעשית אחרי שהתור התפנה)
+            if (IsHandleCreated && !fixPending)
+            {
+                fixPending = true;
+                BeginInvoke(new Action(FixScrollRange));
+            }
+        }
+        bool fixPending;
+
+        void FixScrollRange()
+        {
+            fixPending = false;
+            if (IsDisposed || !host.AutoScroll) return;
+            // הטווח שרשום (Maximum+1) צריך להיות כגובה התוכן. אם הוא גדול ממנו - נשאר אזור ריק, ולכן מאפסים את החישוב
+            if (Math.Abs(host.VerticalScroll.Maximum + 1 - content.Height) <= 2) return;
+            int keep = -host.AutoScrollPosition.Y;
+            host.AutoScroll = false;
+            host.AutoScroll = true;
+            host.AutoScrollPosition = new Point(0, keep);
         }
 
         protected override void OnShown(EventArgs e) { base.OnShown(e); FitContent(); }
@@ -85,7 +106,7 @@ namespace ClaudeNotify
     {
         readonly TrayContext ctx;
         Config cfg;
-        ToggleSwitch tglEnabled, tglSummarize, tglSkip, tglPopup, tglStartup;
+        ToggleSwitch tglEnabled, tglSummarize, tglSkip, tglPopup, tglStartup, tglUpdates;
         Stepper numWords, numSeconds;
         Dropdown cmbPos, cmbLang;
         Field fldProcs;
@@ -139,6 +160,22 @@ namespace ClaudeNotify
             AddRow(cg, L.T("תהליכי העורך", "Editor processes"), L.T("שמות התהליכים של העורכים לזיהוי החלון, מופרדים בפסיק.", "Process names of the editors used to find the window, separated by commas."), fldProcs, true, 0, null);
             tglStartup = new ToggleSwitch();
             AddRow(cg, L.T("הפעל עם Windows", "Start with Windows"), L.T("התוכנה תרוץ ברקע מהאייקון ליד השעון.", "The app runs in the background from the tray icon."), tglStartup, false, 54, null);
+            tglUpdates = new ToggleSwitch();
+            AddRow(cg, L.T("הודע על גרסה חדשה", "Notify about a new version"), L.T("בודק ב-GitHub פעם בשעה, ומקפיץ הודעה כשיוצאת גרסה חדשה.", "Checks GitHub once an hour and shows a popup when a new version is released."), tglUpdates, false, 54, null);
+            var btnUpdate = new PillButton(L.T("בדוק", "Check"), false);
+            btnUpdate.Click += delegate
+            {
+                btnUpdate.Enabled = false;
+                UpdateCheck.CheckNow(this, delegate(int latest)
+                {
+                    btnUpdate.Enabled = true;
+                    if (latest < 0) Dialog.Show(this, "Claude Notify", L.T("לא הצלחתי לבדוק עדכון. בדוק את החיבור לאינטרנט ונסה שוב.", "Could not check for updates. Check your internet connection and try again."));
+                    else if (AppVersion.Build <= 0) Dialog.Show(this, "Claude Notify", L.T("זו בנייה מקומית ללא מספר גרסה. הגרסה האחרונה ב-GitHub היא 1.0." + latest + ".", "This is a local build with no version number. The latest version on GitHub is 1.0." + latest + "."));
+                    else if (latest > AppVersion.Build) { Dialog.Show(this, "Claude Notify", L.T("יש גרסה חדשה: 1.0." + latest + " (אצלך 1.0." + AppVersion.Build + "). דף ההורדה ייפתח עכשיו.", "A new version is available: 1.0." + latest + " (you have 1.0." + AppVersion.Build + "). The download page will open now.")); UpdateCheck.OpenPage(); }
+                    else Dialog.Show(this, "Claude Notify", L.T("יש לך את הגרסה האחרונה (1.0." + AppVersion.Build + ").", "You have the latest version (1.0." + AppVersion.Build + ")."));
+                });
+            };
+            AddRow(cg, L.T("בדוק עדכון עכשיו", "Check for updates now"), AppVersion.Build > 0 ? L.T("הגרסה שלך: 1.0." + AppVersion.Build, "Your version: 1.0." + AppVersion.Build) : L.T("בנייה מקומית (ללא מספר גרסה)", "Local build (no version number)"), btnUpdate, false, 100, null);
             content.Controls.Add(cg);
 
             // ---- חיבור ל-Claude Code
@@ -236,6 +273,7 @@ namespace ClaudeNotify
             cmbPos.Enabled = cfg.UseCustomPopup;
             cmbLang.SelectedIndex = cfg.Language == "en" ? 1 : 0;
             tglStartup.Checked = StartupEnabled();
+            tglUpdates.Checked = cfg.CheckUpdates;
             bool inst = HookInstaller.IsInstalled();
             hookRow.SetTexts(inst ? L.T("החיבור מותקן", "Connection installed") : L.T("החיבור לא מותקן", "Connection not installed"),
                 inst ? L.T("Claude Code ישלח התראה בכל פעם שהוא מסיים להשיב.", "Claude Code will notify you whenever it finishes replying.")
@@ -260,6 +298,7 @@ namespace ClaudeNotify
             cfg.DisplaySeconds = (int)numSeconds.Value;
             cfg.PopupLeft = cmbPos.SelectedIndex == 1;
             cfg.Language = cmbLang.SelectedIndex == 1 ? "en" : "he";
+            cfg.CheckUpdates = tglUpdates.Checked;
             string procs = fldProcs.Box.Text.Trim();
             cfg.Processes = procs.Length > 0 ? procs : "Code, Code - Insiders, Cursor";
             cfg.Save();

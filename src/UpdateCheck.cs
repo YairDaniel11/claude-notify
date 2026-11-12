@@ -30,23 +30,43 @@ namespace ClaudeNotify
             timer = new System.Threading.Timer(delegate { Check(ui, onNewVersion); }, null, 15000, 3600000);
         }
 
+        // מספר הבנייה של ה-Release האחרון ב-GitHub. זורק חריגה אם הבדיקה נכשלה
+        static int FetchLatest()
+        {
+            try { ServicePointManager.SecurityProtocol |= (SecurityProtocolType)3072; } catch { }
+            string json;
+            using (var wc = new WebClient())
+            {
+                wc.Encoding = Encoding.UTF8;
+                wc.Headers[HttpRequestHeader.UserAgent] = "ClaudeNotify";
+                json = wc.DownloadString("https://api.github.com/repos/" + Repo + "/releases/latest");
+            }
+            var d = new JavaScriptSerializer().Deserialize<Dictionary<string, object>>(json);
+            object tagObj;
+            if (!d.TryGetValue("tag_name", out tagObj) || tagObj == null) throw new InvalidOperationException("no tag_name");
+            return ParseBuild(tagObj.ToString());
+        }
+
+        // בדיקה ידנית מכפתור ההגדרות. התוצאה: מספר הבנייה האחרון, או -1 אם הבדיקה נכשלה
+        public static void CheckNow(Control ui, Action<int> done)
+        {
+            var t = new Thread(delegate()
+            {
+                int r = -1;
+                try { r = FetchLatest(); }
+                catch (Exception ex) { Log.Write("update check failed: " + ex.Message); }
+                try { ui.BeginInvoke(new Action(delegate { done(r); })); } catch { }
+            });
+            t.IsBackground = true;
+            t.Start();
+        }
+
         static void Check(Control ui, Action<int> onNewVersion)
         {
             try
             {
                 if (!Config.Load().CheckUpdates) return;
-                try { ServicePointManager.SecurityProtocol |= (SecurityProtocolType)3072; } catch { }
-                string json;
-                using (var wc = new WebClient())
-                {
-                    wc.Encoding = Encoding.UTF8;
-                    wc.Headers[HttpRequestHeader.UserAgent] = "ClaudeNotify";
-                    json = wc.DownloadString("https://api.github.com/repos/" + Repo + "/releases/latest");
-                }
-                var d = new JavaScriptSerializer().Deserialize<Dictionary<string, object>>(json);
-                object tagObj;
-                if (!d.TryGetValue("tag_name", out tagObj) || tagObj == null) return;
-                int latest = ParseBuild(tagObj.ToString());
+                int latest = FetchLatest();
                 if (latest <= AppVersion.Build || latest == notified) return;
                 notified = latest;
                 Log.Write("update: new version v1.0." + latest + " (current " + AppVersion.Build + ")");
