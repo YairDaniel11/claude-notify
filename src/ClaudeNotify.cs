@@ -1032,13 +1032,34 @@ Remove-Item $wav -Force
         public static void Speak(string text) { Call(text, 1, false, ""); }
 
         // קורא repeats פעמים, ובין הקריאות מאזין. כששומעים "שנייה אני מגיע" וכד' - עוצר ועונה
-        public static void Call(string text, int repeats, bool listen, string reply, Action<string, bool> dictate = null)
+        public static void Call(string text, int repeats, bool listen, string reply, Action<string, bool> dictate = null, bool stopOnActivity = false)
         {
             Stop();
             int gen = ++generation;
             repeats = Math.Max(1, Math.Min(10, repeats));
             bool natural = Config.Load().VoiceNatural;
             DateTime callStart = DateTime.Now;
+            var state = new bool[2]; // [0] = הסתיים, [1] = המשתמש ענה (מפסיקים לפקח)
+            if (stopOnActivity)
+            {
+                // משגיח: אם המשתמש נוגע במקלדת או בעכבר בזמן ההקראה (גם באמצע משפט) - עוצרים מיד
+                var w = new Thread(delegate()
+                {
+                    while (!state[0] && !state[1] && gen == generation)
+                    {
+                        Thread.Sleep(250);
+                        if (state[0] || state[1] || gen != generation) break;
+                        if (UserActiveSince(callStart))
+                        {
+                            Log.Write("voice: user is back (activity during call), stopping");
+                            Stop();
+                            break;
+                        }
+                    }
+                });
+                w.IsBackground = true;
+                w.Start();
+            }
             var t = new Thread(delegate()
             {
                 VoiceListener l = null;
@@ -1084,6 +1105,7 @@ Remove-Item $wav -Force
                                 string h = l.HeardSince(t0);
                                 if (IsAck(h))
                                 {
+                                    state[1] = true;
                                     Log.Write("voice: heard ack [" + h.Trim() + "]");
                                     if (!string.IsNullOrEmpty(reply)) say(reply);
                                     if (dictate != null) Dictate(l, gen, dictate, Config.Load().VoiceNeedSend);
@@ -1095,7 +1117,7 @@ Remove-Item $wav -Force
                     }
                 }
                 catch (Exception ex) { Log.Write("voice error: " + ex.Message); }
-                finally { if (l != null && canListen) l.StopListen(); if (listen) HideListen(); }
+                finally { state[0] = true; if (l != null && canListen) l.StopListen(); if (listen) HideListen(); }
             });
             t.IsBackground = true;
             t.Start();
@@ -1887,7 +1909,7 @@ Remove-Item $wav -Force
             Action<string, bool> cb = null;
             if (dict) cb = delegate(string t, bool send) { host.BeginInvoke(new Action(delegate { SendDictation(target, t, send, conv); })); };
             Voice.Call(VoiceText(body), cfg.VoiceRepeats, cfg.VoiceListen,
-                dict ? Voice.T("בסדר, אני מקשיב", "OK, I'm listening") : Voice.T("בסדר, אני מחכה לך", "OK, I'll wait for you"), cb);
+                dict ? Voice.T("בסדר, אני מקשיב", "OK, I'm listening") : Voice.T("בסדר, אני מחכה לך", "OK, I'll wait for you"), cb, cfg.VoiceIdleSeconds > 0);
         }
 
         // מקליד את מה שהוכתב בתיבת השיחה של חלון ה-VS Code שממנו הגיעה ההתראה (בעזרת המנגנון של ההודעה המתוזמנת)
