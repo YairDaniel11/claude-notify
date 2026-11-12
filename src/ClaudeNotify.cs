@@ -346,8 +346,8 @@ namespace ClaudeNotify
         public bool VoiceNatural { get; set; }   // קול טבעי של Edge (דורש אינטרנט)
         public bool VoiceListen { get; set; }    // האזנה לתשובה בקול
         public bool CheckUpdates { get; set; }   // התראה כשיש גרסה חדשה ב-GitHub
-        public bool VoiceHoursOn { get; set; }   // להגביל את הקריאה בקול לטווח שעות
-        public string VoiceRanges { get; set; }  // טווחי השעות, "HH:mm-HH:mm;HH:mm-HH:mm" (אם הסוף קטן מההתחלה - הטווח חוצה חצות)
+        public bool VoiceQuietOn { get; set; }   // להגביל את הקריאה בקול לטווח שעות
+        public string VoiceQuietRanges { get; set; }  // טווחי השעות, "HH:mm-HH:mm;HH:mm-HH:mm" (אם הסוף קטן מההתחלה - הטווח חוצה חצות)
 
         static bool ParseHm(string s, out TimeSpan t)
         {
@@ -367,22 +367,20 @@ namespace ClaudeNotify
             return list;
         }
 
-        // האם עכשיו בתוך אחד מטווחי ההקראה. כשההגבלה כבויה או שאין טווח תקין - תמיד כן
+        // האם מותר לקרוא עכשיו. הטווחים הם שעות אסורות: בתוך אחד מהם - לא קוראים. כשההגבלה כבויה או שאין טווח תקין - תמיד כן
         public bool VoiceAllowedNow()
         {
-            if (!VoiceHoursOn) return true;
-            var ranges = ParseRanges(VoiceRanges);
-            if (ranges.Count == 0) return true;
+            if (!VoiceQuietOn) return true;
             TimeSpan now = DateTime.Now.TimeOfDay;
-            foreach (var r in ranges)
-                if (r[0] < r[1] ? (now >= r[0] && now < r[1]) : (now >= r[0] || now < r[1])) return true;
-            return false;
+            foreach (var r in ParseRanges(VoiceQuietRanges))
+                if (r[0] < r[1] ? (now >= r[0] && now < r[1]) : (now >= r[0] || now < r[1])) return false;
+            return true;
         }
 
         public Config()
         {
             VoiceEnabled = false; UserName = ""; VoiceRepeats = 3; VoiceListen = true; VoiceNatural = true; VoiceGender = "male"; VoiceLang = "auto"; VoicePos = "br"; VoiceIdleSeconds = 60; VoiceRate = 1.0; VoiceAnnounce = true; VoiceNikud = true; VoiceDictate = false; VoiceNeedSend = true; VoiceLowMem = false; VoiceHotkey = "Ctrl+Alt+V";
-            DisplaySeconds = 8; UseCustomPopup = true; Language = "he"; CheckUpdates = true; VoiceRanges = "08:00-22:00";
+            DisplaySeconds = 8; UseCustomPopup = true; Language = "he"; CheckUpdates = true; VoiceQuietRanges = "";
             Enabled = true; Summarize = true; MaxWords = 30; SkipWhenVisible = true;
             Processes = "Code, Code - Insiders, Cursor";
         }
@@ -1952,7 +1950,7 @@ Remove-Item $wav -Force
         {
             if (!cfg.VoiceAllowedNow())
             {
-                Log.Write("voice: skipped, outside the allowed hours (" + cfg.VoiceRanges + ")");
+                Log.Write("voice: skipped, inside the quiet hours (" + cfg.VoiceQuietRanges + ")");
                 return;
             }
             if (cfg.VoiceIdleSeconds > 0 && Voice.IdleSeconds() < cfg.VoiceIdleSeconds)

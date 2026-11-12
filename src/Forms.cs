@@ -337,9 +337,9 @@ namespace ClaudeNotify
             numIdle = Ctl.Num(0, 600);
             AddRow(cv, L.T("קרא רק אם לא נגעתי במחשב (שניות)", "Call only if I did not touch the computer (seconds)"), L.T("אם אתה עובד על המחשב, הוא לא יקרא לך. 0 = תמיד לקרוא. אם חוזרים למחשב באמצע - הקריאות נפסקות.", "If you are working at the computer, it will not call you. 0 = always call. If you come back in the middle, the calls stop."), numIdle, false, 124, null);
             tglHours = new ToggleSwitch();
-            AddRow(cv, L.T("קרא רק בשעות מסוימות", "Call only during certain hours"), L.T("כבוי = קורא בכל שעה. דלוק = קורא רק בטווח השעות שתבחר למטה, ושותק מחוץ אליו.", "Off = calls at any hour. On = calls only within the hours chosen below, and stays silent outside them."), tglHours, false, 54, null);
+            AddRow(cv, L.T("אל תקרא בשעות מסוימות", "Do not call during certain hours"), L.T("כבוי = קורא בכל שעה. דלוק = שותק בטווחי השעות שתבחר למטה, וקורא בשאר הזמן.", "Off = calls at any hour. On = stays silent during the hours chosen below, and calls the rest of the time."), tglHours, false, 54, null);
             hours = new HoursEditor();
-            AddRow(cv, L.T("הטווחים שבהם מותר לקרוא", "Hours in which calling is allowed"), L.T("אפשר להוסיף כמה טווחים, למשל בוקר 12:00-14:30 וצהריים 17:45-19:32. אם הסוף קטן מההתחלה, הטווח חוצה חצות (22:00-06:00 = לילה).", "You can add several ranges, for example morning 12:00-14:30 and afternoon 17:45-19:32. If the end is earlier than the start, the range crosses midnight (22:00-06:00 = night)."), hours, true, 0, null);
+            AddRow(cv, L.T("הטווחים שבהם אסור לקרוא", "Hours in which calling is forbidden"), L.T("אפשר להוסיף כמה טווחים, למשל בוקר 10:00-13:00 וצהריים 16:00-19:00. אם הסוף קטן מההתחלה, הטווח חוצה חצות (22:00-06:00 = לילה).", "You can add several ranges, for example morning 10:00-13:00 and afternoon 16:00-19:00. If the end is earlier than the start, the range crosses midnight (22:00-06:00 = night)."), hours, true, 0, null);
             hours.HeightChanged += delegate
             {
                 var st = hours.Parent != null ? hours.Parent.Parent as Stack : null;
@@ -417,9 +417,9 @@ namespace ClaudeNotify
             tglVoice.Checked = cfg.VoiceEnabled;
             numRepeats.Value = Math.Max(numRepeats.Minimum, Math.Min(numRepeats.Maximum, cfg.VoiceRepeats));
             numIdle.Value = Math.Max(numIdle.Minimum, Math.Min(numIdle.Maximum, cfg.VoiceIdleSeconds));
-            tglHours.Checked = cfg.VoiceHoursOn;
-            hours.Value = cfg.VoiceRanges;
-            hours.Enabled = cfg.VoiceHoursOn;
+            tglHours.Checked = cfg.VoiceQuietOn;
+            hours.Value = cfg.VoiceQuietRanges;
+            hours.Enabled = cfg.VoiceQuietOn;
             tglListen.Checked = cfg.VoiceListen;
             tglShowWin.Checked = cfg.VoiceShowWindow;
             tglNatural.Checked = cfg.VoiceNatural;
@@ -447,8 +447,8 @@ namespace ClaudeNotify
             cfg.VoiceEnabled = tglVoice.Checked;
             cfg.VoiceRepeats = (int)numRepeats.Value;
             cfg.VoiceIdleSeconds = (int)numIdle.Value;
-            cfg.VoiceHoursOn = tglHours.Checked;
-            cfg.VoiceRanges = hours.Value;
+            cfg.VoiceQuietOn = tglHours.Checked;
+            cfg.VoiceQuietRanges = hours.Value;
             cfg.VoiceListen = tglListen.Checked;
             cfg.VoiceShowWindow = tglShowWin.Checked;
             cfg.VoiceNatural = tglNatural.Checked;

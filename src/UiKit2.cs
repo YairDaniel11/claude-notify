@@ -516,7 +516,7 @@ namespace ClaudeNotify
                 foreach (var r in rows) { Controls.Remove(r); r.Dispose(); }
                 rows.Clear();
                 foreach (var p in Config.ParseRanges(value)) AddRange(p[0], p[1]);
-                if (rows.Count == 0) AddRange(new TimeSpan(8, 0, 0), new TimeSpan(22, 0, 0));
+                if (rows.Count == 0) AddRange(new TimeSpan(22, 0, 0), new TimeSpan(8, 0, 0));
                 Relayout();
             }
         }
