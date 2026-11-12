@@ -345,11 +345,12 @@ namespace ClaudeNotify
         public bool VoiceNikud { get; set; }     // ניקוד אוטומטי של הטקסט לפני הקראה (דרך Claude)
         public bool VoiceNatural { get; set; }   // קול טבעי של Edge (דורש אינטרנט)
         public bool VoiceListen { get; set; }    // האזנה לתשובה בקול
+        public bool CheckUpdates { get; set; }   // התראה כשיש גרסה חדשה ב-GitHub
 
         public Config()
         {
             VoiceEnabled = false; UserName = ""; VoiceRepeats = 3; VoiceListen = true; VoiceNatural = true; VoiceGender = "male"; VoiceLang = "auto"; VoicePos = "br"; VoiceIdleSeconds = 60; VoiceRate = 1.0; VoiceAnnounce = true; VoiceNikud = true; VoiceDictate = false; VoiceNeedSend = true; VoiceLowMem = false; VoiceHotkey = "Ctrl+Alt+V";
-            DisplaySeconds = 8; UseCustomPopup = true; Language = "he";
+            DisplaySeconds = 8; UseCustomPopup = true; Language = "he"; CheckUpdates = true;
             Enabled = true; Summarize = true; MaxWords = 30; SkipWhenVisible = true;
             Processes = "Code, Code - Insiders, Cursor";
         }
@@ -1821,6 +1822,8 @@ Remove-Item $wav -Force
             tray.BalloonTipClicked += delegate { if (lastTarget != 0) WinApi.FocusSession(lastTarget, lastSession); };
             tray.Visible = true;
             SyncEnabled();
+            GuiMonitor.Start();
+            UpdateCheck.Start(host, ShowUpdateToast);
 
             var t = new Thread(PipeLoop);
             t.IsBackground = true;
@@ -2230,6 +2233,17 @@ foreach ($h in @(@HANDLES@)) {
 
         ToastForm toast;
 
+        // התראה על גרסה חדשה; לחיצה פותחת את דף ההורדה
+        void ShowUpdateToast(int build)
+        {
+            if (toast != null && !toast.IsDisposed) toast.Close();
+            toast = new ToastForm(L.T("גרסה 1.0." + build + " זמינה. לחץ כאן כדי לפתוח את דף ההורדה.", "Version 1.0." + build + " is available. Click here to open the download page."),
+                L.T("יש גרסה חדשה של Claude Notify", "A new version of Claude Notify"), 0, "", "", 15, cfg.PopupLeft);
+            toast.OnClick = UpdateCheck.OpenPage;
+            toast.Cursor = Cursors.Hand;
+            toast.Show();
+        }
+
         void Show(long target, string body, string session, string cwd, string title)
         {
             lastTarget = target;
@@ -2245,6 +2259,35 @@ foreach ($h in @(@HANDLES@)) {
         }
     }
 
+    // ---------------------------------------------------------------- GUI handle monitor
+    // "Error creating window handle" קורה כשהתהליך מגיע למכסת ה-Handles של Windows (גופנים, חלונות).
+    // המנטר רושם את הספירה ללוג, ומשחרר אובייקטים שלא שוחררו (איסוף זבל) לפני שמגיעים למכסה
+    static class GuiMonitor
+    {
+        [DllImport("user32.dll")] static extern uint GetGuiResources(IntPtr hProcess, uint flags);
+        static System.Threading.Timer timer;
+        static int tick;
+
+        public static void Start()
+        {
+            timer = new System.Threading.Timer(delegate { Check(); }, null, 60000, 300000);
+        }
+
+        static void Check()
+        {
+            try
+            {
+                var p = Process.GetCurrentProcess();
+                uint gdi = GetGuiResources(p.Handle, 0), user = GetGuiResources(p.Handle, 1);
+                bool high = gdi > 1500 || user > 1500;
+                if (high || ++tick % 12 == 1)
+                    Log.Write("handles: gdi=" + gdi + " user=" + user + " total=" + p.HandleCount + (high ? " (collecting)" : ""));
+                if (high) { GC.Collect(); GC.WaitForPendingFinalizers(); GC.Collect(); }
+            }
+            catch { }
+        }
+    }
+
     // ---------------------------------------------------------------- Popup notification
     class ToastForm : Form
     {
@@ -2252,7 +2295,9 @@ foreach ($h in @(@HANDLES@)) {
         readonly long target;
         readonly string session;
         readonly Color borderColor = Color.FromArgb(217, 119, 87);
+        Font titleFont, bodyFont, closeFont;
         int remainingMs;
+        public Action OnClick;   // אם הוגדר: לחיצה על ההתראה מריצה אותו במקום להעלות את חלון ה-VS Code
 
         public ToastForm(string body, string heading, long target, string session, string cwd, int seconds, bool left)
         {
@@ -2272,21 +2317,27 @@ foreach ($h in @(@HANDLES@)) {
             bool rtl = L.He;
 
             int width = Theme.S(380), inner = Theme.S(340);
-            var titleFont = new Font("Segoe UI", 10f, FontStyle.Bold);
-            var bodyFont = new Font("Segoe UI", 10.5f);
+            // הגופנים נשמרים כדי לשחרר אותם בסגירה (אחרת כל התראה מדליפה Handles של GDI עד שחלון חדש כבר לא ניתן ליצירה)
+            titleFont = new Font("Segoe UI", 10f, FontStyle.Bold);
+            bodyFont = new Font("Segoe UI", 10.5f);
+            closeFont = new Font("Segoe UI", 9f);
             int textH = TextRenderer.MeasureText(body, bodyFont, new Size(inner, 0),
                 TextFormatFlags.WordBreak | (rtl ? TextFormatFlags.RightToLeft : TextFormatFlags.Left) | TextFormatFlags.TextBoxControl).Height + 4;
 
             var title = new Label { Text = string.IsNullOrEmpty(heading) ? "Claude Code" : heading, AutoEllipsis = true, Font = titleFont, ForeColor = borderColor, AutoSize = false, Size = new Size(inner, Theme.S(22)), Location = new Point(Theme.S(20), Theme.S(10)), TextAlign = ContentAlignment.TopLeft, RightToLeft = rtl ? RightToLeft.Yes : RightToLeft.No };
             var lbl = new Label { Text = body, Font = bodyFont, ForeColor = fg, AutoSize = false, Size = new Size(inner, textH), Location = new Point(Theme.S(20), Theme.S(36)), TextAlign = ContentAlignment.TopLeft, RightToLeft = rtl ? RightToLeft.Yes : RightToLeft.No };
-            var close = new Label { Text = "✕", Font = new Font("Segoe UI", 9f), ForeColor = closeColor, AutoSize = true, Location = new Point(rtl ? Theme.S(4) : width - Theme.S(22), Theme.S(4)), Cursor = Cursors.Hand };
+            var close = new Label { Text = "✕", Font = closeFont, ForeColor = closeColor, AutoSize = true, Location = new Point(rtl ? Theme.S(4) : width - Theme.S(22), Theme.S(4)), Cursor = Cursors.Hand };
             close.Click += delegate { Close(); };
             Controls.Add(close);
             Controls.Add(title);
             Controls.Add(lbl);
             Size = new Size(width, Theme.S(36) + textH + Theme.S(14));
 
-            EventHandler click = delegate { WinApi.FocusSession(this.target, this.session); Close(); };
+            EventHandler click = delegate
+            {
+                if (OnClick != null) OnClick(); else WinApi.FocusSession(this.target, this.session);
+                Close();
+            };
             Click += click; title.Click += click; lbl.Click += click;
 
             var wa = Screen.PrimaryScreen.WorkingArea;
@@ -2324,7 +2375,13 @@ foreach ($h in @(@HANDLES@)) {
 
         protected override void Dispose(bool disposing)
         {
-            if (disposing) timer.Dispose();
+            if (disposing)
+            {
+                timer.Dispose();
+                if (titleFont != null) titleFont.Dispose();
+                if (bodyFont != null) bodyFont.Dispose();
+                if (closeFont != null) closeFont.Dispose();
+            }
             base.Dispose(disposing);
         }
     }

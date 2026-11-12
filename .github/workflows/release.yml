@@ -19,6 +19,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Stamp version
+        shell: pwsh
+        run: |
+          $f = 'src/UpdateCheck.cs'
+          (Get-Content $f -Raw -Encoding UTF8) -replace 'public const int Build = 0;', 'public const int Build = ${{ github.run_number }};' | Set-Content $f -Encoding UTF8 -NoNewline
+
       - name: Build
         shell: cmd
         run: build.cmd
